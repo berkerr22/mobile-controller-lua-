@@ -1,0 +1,2323 @@
+--[[
+	MobileController.lua
+	Handles mobile input buttons (Run, Dash, Jump) and dynamic UI visibility based on the active input device.
+	Intended location: ReplicatedStorage.SharedModules
+	Last Revision: 2025-05-04
+]]
+
+--// Services //--
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ReplicatedFirst = game:GetService("ReplicatedFirst")
+local StarterGui = game:GetService("StarterGui")
+
+--// Module //--
+local MobileController = {}
+MobileController.__index = MobileController
+
+--// State Variables //--
+local isRunning = false
+local isDashOnCooldown = false
+local mobileFrame = nil -- Reference to the cloned MobileFrame UI element
+local inputEvents = nil -- Reference to the required InputEvents module
+local isUISetup = false -- Flag indicating if the UI has been successfully set up
+local lastSetupTime = 0 -- Timestamp of the last UI setup attempt (for debouncing)
+local cachedTweens = {} -- Pre-cached tweens for button animations
+local setupInProgress = false -- Flag to prevent concurrent setup calls
+local characterConnections = {} -- Stores connections related to the character lifecycle
+local deviceTrackingConnections = {} -- Stores connections for device input tracking
+local jumpHoldConnection = nil -- Stores the Heartbeat connection for jump hold
+local dashCooldownConnection = nil -- Stores the Heartbeat connection for dash cooldown
+
+--// Device State Management //--
+local DeviceState = {
+	lastActiveDevice = "Unknown", -- Tracks the last input device type ("Mobile", "Gamepad", "Keyboard")
+	currentPlatform = "Unknown", -- Detected platform type (e.g., "Mobile", "Desktop", "StudioMobileEmulator")
+	isRealMobileDevice = false, -- Flag if the detected platform should use mobile controls
+
+	-- Device Capabilities (updated by DetectPlatform)
+	hasGamepad = false,
+	hasKeyboard = false,
+	hasMouse = false,
+	hasTouch = false,
+
+	-- UI Transition State
+	isTransitioning = false, -- Is a Show/Hide UI animation currently playing?
+	frameVisibilityTween = nil, -- Active tween for GroupTransparency
+	scaleVisibilityTween = nil, -- Active tween for UIScale
+
+	-- Debounce
+	lastDeviceSwitchTime = 0 -- Timestamp of the last device switch (for debouncing)
+}
+
+--// Merkezi Animasyon Sistemi //--
+local AnimationManager = {
+	-- Animasyon yapılandırmaları (daha fazla özelleştirme seçeneği)
+	CONFIG = {
+		UI = {
+			-- UI geçiş ayarları
+			FADE_IN_TIME = 0.5,                          
+			FADE_OUT_TIME = 0.5,                         
+			EASING_STYLE_SHOW = Enum.EasingStyle.Quint,   -- Hide ile aynı stil, tersine çalışacak
+			EASING_DIRECTION_SHOW = Enum.EasingDirection.Out, 
+			EASING_STYLE_HIDE = Enum.EasingStyle.Quint,  
+			EASING_DIRECTION_HIDE = Enum.EasingDirection.Out, 
+			START_SCALE = 0.75,                          -- Hide'ın son ölçeği
+			END_SCALE = 1.0,                             -- Normal ölçek
+			-- Yeni özelleştirmeler
+			ENABLE_POSITION_EFFECT = false,              -- Pozisyon efekti kullanılsın mı?
+			POSITION_OFFSET_Y = 20,                      -- Pixel cinsinden Y ekseninde kaydırma
+			ROTATION_ENABLED = false,                    -- Rotasyon efekti
+			ROTATION_AMOUNT = 5,                         -- Derece cinsinden rotasyon
+			ENABLE_EXTRA_EFFECTS = false                 -- Ekstra efektler (parlaklık, vs.)
+		},
+
+		BUTTON = {
+			-- Genel buton ayarları
+			PRESS_DURATION = 0.12,                       
+			RELEASE_DURATION = 0.2,                      
+			COLOR_TRANSITION = 0.3,                      
+			SCALE_FACTOR = 0.92,                         -- Daha az küçülme
+
+			-- Yeni btn_flash ayarları
+			BTN_FLASH = {
+				MIN_TRANSPARENCY = 0.3,                 -- Minimum saydamlık (görünür)
+				MAX_TRANSPARENCY = 0.75,                -- Maksimum saydamlık (kaybolma)
+				FADE_IN_TIME = 0.08,                    -- Görünme süresi
+				FADE_OUT_TIME = 0.2,                    -- Kaybolma süresi
+				EASING_STYLE = Enum.EasingStyle.Sine,   -- Easing stili
+				EASING_DIRECTION = Enum.EasingDirection.Out -- Easing yönü
+			},
+
+			-- Easing stilleri
+			PRESS_STYLE = Enum.EasingStyle.Sine,
+			PRESS_DIRECTION = Enum.EasingDirection.Out,
+			RELEASE_STYLE = Enum.EasingStyle.Back,
+			RELEASE_DIRECTION = Enum.EasingDirection.Out,
+			COLOR_STYLE = Enum.EasingStyle.Sine,
+			COLOR_DIRECTION = Enum.EasingDirection.Out,
+
+			-- Run Button özellikleri
+			RUN = {
+				DEFAULT_SIZE = UDim2.new(0, 70, 0, 70),  
+				PRESSED_SIZE = UDim2.new(0, 65, 0, 65),  
+				TOGGLE_ON_COLOR = Color3.fromRGB(0, 200, 255), 
+				TOGGLE_OFF_COLOR = Color3.fromRGB(255, 255, 255), 
+				PRESS_ANIMATION_DURATION = 0.12,         
+				RELEASE_ANIMATION_DURATION = 0.2        
+			},
+
+			-- Dash Button özellikleri
+			DASH = {
+				DEFAULT_SIZE = UDim2.new(0, 70, 0, 70),  
+				PRESSED_SIZE = UDim2.new(0, 65, 0, 65),  
+				PRESS_ANIMATION_DURATION = 0.12,         
+				RELEASE_ANIMATION_DURATION = 0.2       
+			},
+
+			-- Jump Button özellikleri
+			JUMP = {
+				DEFAULT_SIZE = UDim2.new(0, 90, 0, 90),  
+				PRESSED_SIZE = UDim2.new(0, 84, 0, 84),  
+				DEFAULT_COLOR = Color3.fromRGB(255, 255, 255), 
+				PRESSED_COLOR = Color3.fromRGB(0, 200, 255),   
+				PRESS_ANIMATION_DURATION = 0.12,         
+				RELEASE_ANIMATION_DURATION = 0.2        
+			}
+		},
+
+		-- Cooldown özellikleri
+		COOLDOWN = {
+			COLOR = Color3.fromRGB(255, 70, 70),         
+			FILL_START_SIZE = UDim2.new(0, 70, 0, 70),   
+			TEXT_COLOR = Color3.fromRGB(255, 255, 255)   
+		}
+	},
+
+	-- Tween oluşturma fonksiyonu (basitleştirilmiş)
+	CreateTween = function(self, instance, properties, duration, style, direction, callback)
+		-- Tween bilgisi oluştur
+		local tweenInfo = TweenInfo.new(
+			duration or 0.5,
+			style or Enum.EasingStyle.Quad,
+			direction or Enum.EasingDirection.Out
+		)
+
+		-- Tween oluştur
+		local tween = TweenService:Create(instance, tweenInfo, properties)
+
+		-- Tamamlanma işleyicisi (varsa)
+		if callback then
+			local connection
+			connection = tween.Completed:Connect(function()
+				connection:Disconnect()
+				callback()
+			end)
+		end
+
+		return tween
+	end,
+
+	-- Basitleştirilmiş buton basma animasyonu
+	AnimateButtonPress = function(self, button, defaultSize, targetSize)
+		local finalTargetSize = targetSize or UDim2.new(
+			defaultSize.X.Scale,
+			defaultSize.X.Offset * self.CONFIG.BUTTON.SCALE_FACTOR,
+			defaultSize.Y.Scale,
+			defaultSize.Y.Offset * self.CONFIG.BUTTON.SCALE_FACTOR
+		)
+
+		-- btn_flash'ı etkinleştir
+		local btnFlash = button:FindFirstChild("btn_flash")
+		if btnFlash then
+			btnFlash.Visible = true
+			btnFlash.BackgroundTransparency = self.CONFIG.BUTTON.BTN_FLASH.MIN_TRANSPARENCY
+		end
+
+		return self:CreateTween(
+			button, 
+			{Size = finalTargetSize}, 
+			self.CONFIG.BUTTON.PRESS_DURATION,
+			self.CONFIG.BUTTON.PRESS_STYLE,
+			self.CONFIG.BUTTON.PRESS_DIRECTION
+		)
+	end,
+
+	-- Basitleştirilmiş buton bırakma animasyonu
+	AnimateButtonRelease = function(self, button, originalSize)
+		-- btn_flash'ı soluklaştır
+		local btnFlash = button:FindFirstChild("btn_flash")
+		if btnFlash then
+			self:CreateTween(
+				btnFlash,
+				{BackgroundTransparency = self.CONFIG.BUTTON.BTN_FLASH.MAX_TRANSPARENCY},
+				self.CONFIG.BUTTON.BTN_FLASH.FADE_OUT_TIME,
+				self.CONFIG.BUTTON.BTN_FLASH.EASING_STYLE,
+				self.CONFIG.BUTTON.BTN_FLASH.EASING_DIRECTION,
+				function()
+					btnFlash.Visible = false
+				end
+			):Play()
+		end
+
+		return self:CreateTween(
+			button, 
+			{Size = originalSize}, 
+			self.CONFIG.BUTTON.RELEASE_DURATION,
+			self.CONFIG.BUTTON.RELEASE_STYLE, 
+			self.CONFIG.BUTTON.RELEASE_DIRECTION
+		)
+	end,
+
+	-- Basitleştirilmiş renk geçiş animasyonu
+	AnimateColorChange = function(self, instance, targetColor)
+		local property = "ImageColor3"
+		if instance:IsA("TextLabel") or instance:IsA("TextButton") then
+			property = "TextColor3"
+		end
+
+		local properties = {}
+		properties[property] = targetColor
+
+		return self:CreateTween(
+			instance,
+			properties,
+			self.CONFIG.BUTTON.COLOR_TRANSITION,
+			self.CONFIG.BUTTON.COLOR_STYLE,
+			self.CONFIG.BUTTON.COLOR_DIRECTION
+		)
+	end,
+
+	-- btn_flash etkinleştirme (basma efekti)
+	ShowButtonFlash = function(self, button)
+		local btnFlash = button:FindFirstChild("btn_flash")
+		if not btnFlash then return nil end
+
+		btnFlash.Visible = true
+		btnFlash.BackgroundTransparency = self.CONFIG.BUTTON.BTN_FLASH.MAX_TRANSPARENCY
+
+		local tween = self:CreateTween(
+			btnFlash,
+			{BackgroundTransparency = self.CONFIG.BUTTON.BTN_FLASH.MIN_TRANSPARENCY},
+			self.CONFIG.BUTTON.BTN_FLASH.FADE_IN_TIME,
+			self.CONFIG.BUTTON.BTN_FLASH.EASING_STYLE,
+			self.CONFIG.BUTTON.BTN_FLASH.EASING_DIRECTION
+		)
+
+		tween:Play()
+		return tween
+	end,
+
+	-- btn_flash gizleme (bırakma efekti)
+	HideButtonFlash = function(self, button)
+		local btnFlash = button:FindFirstChild("btn_flash")
+		if not btnFlash then return nil end
+
+		local tween = self:CreateTween(
+			btnFlash,
+			{BackgroundTransparency = self.CONFIG.BUTTON.BTN_FLASH.MAX_TRANSPARENCY},
+			self.CONFIG.BUTTON.BTN_FLASH.FADE_OUT_TIME,
+			self.CONFIG.BUTTON.BTN_FLASH.EASING_STYLE,
+			self.CONFIG.BUTTON.BTN_FLASH.EASING_DIRECTION,
+			function()
+				btnFlash.Visible = false
+			end
+		)
+
+		tween:Play()
+		return tween
+	end,
+
+	-- Show UI fonksiyonu - Hide'ın tam tersi
+	ShowUI = function(self, frame, callback)
+		if not frame then return end
+
+		-- UIScale oluştur veya al
+		local uiScale = frame:FindFirstChildOfClass("UIScale")
+		if not uiScale then
+			uiScale = Instance.new("UIScale")
+			uiScale.Parent = frame
+		end
+
+		-- Başlangıç durumunu ayarla (Hide'ın son durumu)
+		frame.Visible = true
+		frame.GroupTransparency = 1
+		uiScale.Scale = self.CONFIG.UI.START_SCALE
+
+		-- Konumsal efekt için başlangıç konumu
+		local originalPosition
+		if self.CONFIG.UI.ENABLE_POSITION_EFFECT then
+			originalPosition = frame.Position
+			frame.Position = UDim2.new(
+				originalPosition.X.Scale,
+				originalPosition.X.Offset,
+				originalPosition.Y.Scale,
+				originalPosition.Y.Offset + self.CONFIG.UI.POSITION_OFFSET_Y
+			)
+		end
+
+		-- Rotasyon efekti için
+		local originalRotation
+		if self.CONFIG.UI.ROTATION_ENABLED then
+			originalRotation = frame.Rotation
+			frame.Rotation = originalRotation - self.CONFIG.UI.ROTATION_AMOUNT
+		end
+
+		-- Görünürlük tween'i (Hide'ın tam tersi)
+		local opacityTween = self:CreateTween(
+			frame,
+			{GroupTransparency = 0},
+			self.CONFIG.UI.FADE_IN_TIME,
+			self.CONFIG.UI.EASING_STYLE_SHOW,
+			self.CONFIG.UI.EASING_DIRECTION_SHOW
+		)
+
+		-- Ölçek tween'i (Hide'ın tam tersi)
+		local scaleTween = self:CreateTween(
+			uiScale,
+			{Scale = self.CONFIG.UI.END_SCALE},
+			self.CONFIG.UI.FADE_IN_TIME,
+			self.CONFIG.UI.EASING_STYLE_SHOW,
+			self.CONFIG.UI.EASING_DIRECTION_SHOW,
+			function()
+				-- Son temizlik
+				if callback then callback() end
+			end
+		)
+
+		-- Konum tween'i
+		if self.CONFIG.UI.ENABLE_POSITION_EFFECT and originalPosition then
+			self:CreateTween(
+				frame,
+				{Position = originalPosition},
+				self.CONFIG.UI.FADE_IN_TIME,
+				self.CONFIG.UI.EASING_STYLE_SHOW,
+				self.CONFIG.UI.EASING_DIRECTION_SHOW
+			):Play()
+		end
+
+		-- Rotasyon tween'i
+		if self.CONFIG.UI.ROTATION_ENABLED and originalRotation then
+			self:CreateTween(
+				frame,
+				{Rotation = originalRotation},
+				self.CONFIG.UI.FADE_IN_TIME,
+				self.CONFIG.UI.EASING_STYLE_SHOW,
+				self.CONFIG.UI.EASING_DIRECTION_SHOW
+			):Play()
+		end
+
+		opacityTween:Play()
+		scaleTween:Play()
+
+		return opacityTween, scaleTween
+	end,
+
+	-- Hide UI fonksiyonu
+	HideUI = function(self, frame, callback)
+		if not frame then return end
+
+		-- UIScale bul
+		local uiScale = frame:FindFirstChildOfClass("UIScale")
+		if not uiScale then
+			uiScale = Instance.new("UIScale")
+			uiScale.Scale = self.CONFIG.UI.END_SCALE
+			uiScale.Parent = frame
+		end
+
+		-- Konumsal efekt için orijinal konum
+		local originalPosition
+		if self.CONFIG.UI.ENABLE_POSITION_EFFECT then
+			originalPosition = frame.Position
+		end
+
+		-- Rotasyon efekti için
+		local originalRotation
+		if self.CONFIG.UI.ROTATION_ENABLED then
+			originalRotation = frame.Rotation
+		end
+
+		-- Saydamlık tween'i
+		local opacityTween = self:CreateTween(
+			frame,
+			{GroupTransparency = 1},
+			self.CONFIG.UI.FADE_OUT_TIME,
+			self.CONFIG.UI.EASING_STYLE_HIDE,
+			self.CONFIG.UI.EASING_DIRECTION_HIDE
+		)
+
+		-- Ölçek tween'i
+		local scaleTween = self:CreateTween(
+			uiScale,
+			{Scale = self.CONFIG.UI.START_SCALE},
+			self.CONFIG.UI.FADE_OUT_TIME,
+			self.CONFIG.UI.EASING_STYLE_HIDE,
+			self.CONFIG.UI.EASING_DIRECTION_HIDE,
+			function()
+				frame.Visible = false
+				uiScale.Scale = self.CONFIG.UI.END_SCALE -- Reset for next time
+				if callback then callback() end
+			end
+		)
+
+		-- Konum tween'i
+		if self.CONFIG.UI.ENABLE_POSITION_EFFECT and originalPosition then
+			self:CreateTween(
+				frame,
+				{Position = UDim2.new(
+					originalPosition.X.Scale,
+					originalPosition.X.Offset,
+					originalPosition.Y.Scale,
+					originalPosition.Y.Offset + self.CONFIG.UI.POSITION_OFFSET_Y
+					)},
+				self.CONFIG.UI.FADE_OUT_TIME,
+				self.CONFIG.UI.EASING_STYLE_HIDE,
+				self.CONFIG.UI.EASING_DIRECTION_HIDE
+			):Play()
+		end
+
+		-- Rotasyon tween'i
+		if self.CONFIG.UI.ROTATION_ENABLED and originalRotation then
+			self:CreateTween(
+				frame,
+				{Rotation = originalRotation + self.CONFIG.UI.ROTATION_AMOUNT},
+				self.CONFIG.UI.FADE_OUT_TIME,
+				self.CONFIG.UI.EASING_STYLE_HIDE,
+				self.CONFIG.UI.EASING_DIRECTION_HIDE
+			):Play()
+		end
+
+		opacityTween:Play()
+		scaleTween:Play()
+
+		return opacityTween, scaleTween
+	end
+}
+
+-- ==========================================
+-- ===========      SETTINGS      ===========
+-- ==========================================
+local SETTINGS = {
+	-- General Settings
+	GENERAL = {
+		DEBUG_MODE = false, -- Show debug messages in the output
+		AUTO_SETUP_ON_LOAD = true, -- Attempt setup when the game loads (managed by Initialize)
+		AUTO_SETUP_ON_CHAR_ADDED = true, -- Attempt setup/reset when character is added (main logic in WatchCharacterLifecycle)
+		AUTO_RESET_ON_CHAR_REMOVING = true, -- Perform cleanup when character is removing
+		FORCE_ENABLE_IN_STUDIO = false, -- Force mobile UI activation in Studio (for testing, keep FALSE for release)
+		PRIORITY_LEVEL = Enum.RenderPriority.Input.Value, -- Render priority for UI elements
+		STRICT_MOBILE_DETECTION = true, -- Only treat touch-only devices as truly mobile (ignore hybrids if true)
+		INITIAL_SETUP_DELAY = 0.5, -- Delay (seconds) for initial setup if character already exists on Initialize
+		CHARACTER_RESET_DELAY = 0.7, -- Delay (seconds) after CharacterAdded before checking/setting up UI
+	},
+
+	-- Studio Testing Specifics
+	STUDIO_TESTING = {
+		MOBILE_EMULATOR_FORCE_SHOW = true, -- Attempt to force UI visibility in Studio's mobile emulator mode
+		RESET_CHARACTER_CHECK = true, -- Enable checks/resets related to character reset ('R' key)
+	},
+
+	-- Functional Settings
+	FUNCTIONALITY = {
+		DASH = {
+			COOLDOWN_DURATION = 5, -- Cooldown time (seconds) for the dash ability
+			MINIMUM_MOVEMENT_THRESHOLD = 0.1, -- Minimum MoveDirection magnitude required to dash
+			REQUIRES_MOVEMENT = true -- Does the player need to be moving to dash?
+		},
+		JUMP = {
+			COOLDOWN_DURATION = 1.0, -- Cooldown time (seconds) between jumps when holding
+			ALLOW_HOLD_JUMP = true, -- Allow continuous jumping by holding the button
+			PREVENT_AIR_JUMP = true, -- Should jumping be prevented while airborne? (Actual check likely in InputEvents)
+			MINIMUM_MOVEMENT_THRESHOLD = 0 -- Minimum MoveDirection magnitude required to jump (usually 0)
+		},
+		BUTTON_PROTECTION = {
+			PREVENT_RAPID_CLICKS = true, -- Prevent button actions if clicked too rapidly
+			RAPID_CLICK_THRESHOLD = 0.1 -- Minimum time (seconds) between clicks
+		}
+	},
+
+	-- Resilience Settings
+	RESILIENCE = {
+		MAX_RETRY_ATTEMPTS = 3, -- Max attempts to find the InputEvents module
+		RETRY_DELAY_BASE = 0.5, -- Base delay (seconds) for retries
+		AUTO_RECOVER_ON_ERROR = true, -- Enable automatic recovery mechanisms (like retries)
+		SETUP_TIMEOUT = 5 -- Max time (seconds) to wait for PlayerGui during setup
+	},
+
+	-- Performance Settings
+	PERFORMANCE = {
+		PRE_CACHE_TWEENS = true, -- Create button animation tweens on setup?
+		RENDER_PRIORITY = Enum.RenderPriority.Input.Value -- Render priority for the ScreenGui
+	},
+
+	-- Device Detection Settings
+	DEVICE_DETECTION = {
+		DEBOUNCE_TIME = 0.3, -- Minimum time (seconds) between device switch detections
+		THUMBSTICK_THRESHOLD = 0.2, -- Minimum magnitude for gamepad thumbstick movement to register as active
+		PRIORITY_ORDER = {"Gamepad", "Keyboard", "Mobile"}, -- Order used to determine UI visibility when multiple inputs are active
+		STUDIO_GRACE_PERIOD = 0.5, -- Additional delay (seconds) in Studio for certain checks
+		DOUBLE_CHECK_DELAY = 0.5, -- Delay (seconds) after GamepadDisconnect before checking again
+	},
+}
+-- ==========================================
+-- =========== HELPER FUNCTIONS ===========
+-- ==========================================
+
+--// Debug Print Utility //--
+local function debugPrint(...)
+	if SETTINGS.GENERAL.DEBUG_MODE then
+		local prefix = "[MobileController - " .. string.format("%.3f", time()) .. "]"
+		print(prefix, ...)
+	end
+end
+
+--// Safe Require Utility //--
+-- Safely requires a ModuleScript, catching errors.
+local function safeRequire(module)
+	if not module or not module:IsA("ModuleScript") then return nil end
+	local success, result = pcall(require, module)
+	if success then
+		return result
+	else
+		warn("[MobileController] Failed to require module:", module:GetFullName(), "| Error:", result)
+		return nil
+	end
+end
+
+-- ==========================================
+-- =========== CORE FUNCTIONS =============
+-- ==========================================
+
+--// Platform Detection //--
+-- Detects the current platform and device capabilities.
+-- MODIFIED: Added slight tolerance for initial viewport detection in Studio Emulator.
+function MobileController:DetectPlatform()
+	-- Stüdyo ortamı kontrolü
+	local isStudio = RunService:IsStudio()
+
+	-- Giriş özelliklerini al
+	local touchEnabled = UserInputService.TouchEnabled
+	local keyboardEnabled = UserInputService.KeyboardEnabled
+	local mouseEnabled = UserInputService.MouseEnabled
+	local gamepadEnabled = UserInputService.GamepadEnabled  -- Gamepad kontrolü
+
+	local platformType = "Unknown"
+	local isMobile = false -- Should mobile UI be shown for this platform?
+
+	local previousPlatform = DeviceState.currentPlatform -- For logging changes
+
+	-- Ekran boyutu kontrolü
+	local isSmallScreen = false
+	local isPortraitOrientation = false
+
+	local camera = workspace.CurrentCamera
+	if camera then
+		local viewportSize = camera.ViewportSize
+		isSmallScreen = viewportSize.X < 1024 or viewportSize.Y < 768
+		isPortraitOrientation = viewportSize.X / viewportSize.Y < 1.0
+	end
+
+	-- Gamepad kontrolü - Gamepad varsa direkt gizle kısmının düzeltilmesi
+	if gamepadEnabled then
+		local gamepadConnected = false
+		for _, gamepad in ipairs(Enum.UserInputType:GetEnumItems()) do
+			if string.find(gamepad.Name, "Gamepad") and UserInputService:GetGamepadConnected(gamepad) then
+				gamepadConnected = true
+				break
+			end
+		end
+
+		if gamepadConnected then
+			debugPrint("DetectPlatform: Gamepad bağlı, mobil UI gizlenecek")
+			-- Gamepad bağlıysa ve başka bir şey yapmadan önce DeviceState'i güncelle
+			DeviceState.hasGamepad = true
+			DeviceState.lastActiveDevice = "Gamepad"
+			platformType = "Desktop" -- Desktop olarak işaretle
+			isMobile = false -- Mobil değil olarak işaretle
+
+			-- ÖNEMLİ: Kontrol et ve UI'yi düzgünce gizle
+			if mobileFrame and mobileFrame.Parent and mobileFrame.Visible then
+				-- UI animasyonla gizlenecek (asenkron - bekleme yok)
+				task.spawn(function()
+					self:HideMobileUI() -- Animasyonla gizle
+				end)
+			end
+
+			-- DeviceState güncellendi, diğer kontrollere gerek yok
+			DeviceState.currentPlatform = platformType
+			DeviceState.isRealMobileDevice = isMobile
+			DeviceState.hasTouch = touchEnabled
+			DeviceState.hasKeyboard = keyboardEnabled
+			DeviceState.hasMouse = mouseEnabled
+
+			return platformType, isMobile
+		end
+	end
+
+	-- Platform logic
+	if isStudio then
+		-- Handle Studio environment (emulator, forced mode, desktop)
+		local forceMobileInStudio = SETTINGS.GENERAL.FORCE_ENABLE_IN_STUDIO
+		local checkEmulator = SETTINGS.STUDIO_TESTING.MOBILE_EMULATOR_FORCE_SHOW
+
+		if forceMobileInStudio then
+			platformType = "StudioMobileForced"
+			isMobile = true
+			debugPrint("Studio - Mobile UI forced via SETTINGS.GENERAL.FORCE_ENABLE_IN_STUDIO")
+		elseif checkEmulator then
+			-- Try to detect emulator based on viewport/touch
+			-- Check touch first as it's a strong indicator in emulator
+			if touchEnabled then
+				platformType = "StudioMobileEmulator"
+				isMobile = true
+				debugPrint("Studio - Mobile emulator detected (TouchEnabled is true)")
+			else
+				-- If touch not enabled yet, check viewport heuristics as fallback
+				local camera = workspace.CurrentCamera
+				if camera then
+					local viewportSize = camera.ViewportSize
+					-- Add a small check for initial zero/small viewport size during startup
+					if viewportSize.X > 100 and viewportSize.Y > 100 then -- Avoid calculating with zero/tiny viewport
+						local aspectRatio = viewportSize.X / viewportSize.Y
+						local isPortrait = aspectRatio < 0.85 -- Slightly adjusted threshold
+						local likelyEmulator = isPortrait or (viewportSize.X < 650) -- Slightly adjusted threshold
+
+						if likelyEmulator then
+							platformType = "StudioMobileEmulator"
+							isMobile = true
+							debugPrint("Studio - Mobile emulator detected (Portrait/SmallViewport heuristic)")
+						else
+							platformType = "StudioDesktop"
+							isMobile = false
+							debugPrint("Studio - Desktop mode detected (Viewport heuristic)")
+						end
+					else
+						platformType = "StudioDesktop" -- Default to desktop if viewport is unreliable initially
+						isMobile = false
+						debugPrint("Studio - Desktop mode detected (Initial viewport unreliable)")
+					end
+				else
+					platformType = "StudioDesktop" -- Default to desktop if camera isn't ready
+					isMobile = false
+					debugPrint("Studio - Desktop mode detected (Camera not ready)")
+				end
+			end
+		else
+			platformType = "StudioDesktop"
+			isMobile = false
+			debugPrint("Studio - Desktop mode (Emulator check disabled)")
+		end
+	else
+		-- GERÇEK CİHAZLAR İÇİN YENİ, BASİTLEŞTİRİLMİŞ MANTIK
+		-- Eğer dokunmatik ekran VEYA küçük ekran VEYA dikey yönelim varsa = MOBİL
+		if touchEnabled or isSmallScreen or isPortraitOrientation then
+			platformType = "Mobile"
+			isMobile = true
+			debugPrint("Real device - Mobile detected (Touch:" .. tostring(touchEnabled) .. 
+				" SmallScreen:" .. tostring(isSmallScreen) .. 
+				" Portrait:" .. tostring(isPortraitOrientation) .. ")")
+		else
+			platformType = "Desktop"
+			isMobile = false
+			debugPrint("Real device - Desktop detected (no mobile indicators)")
+		end
+	end
+
+	-- Update DeviceState only if there's a change or if platform is still unknown
+	if DeviceState.currentPlatform ~= platformType or DeviceState.isRealMobileDevice ~= isMobile or DeviceState.currentPlatform == "Unknown" then
+		debugPrint("Platform Change Detected:", previousPlatform, "->", platformType, "| IsMobile:", DeviceState.isRealMobileDevice, "->", isMobile)
+		DeviceState.currentPlatform = platformType
+		DeviceState.isRealMobileDevice = isMobile -- This flag determines if mobile controls should *ever* be used
+
+		-- Update capability flags in DeviceState consistently
+		DeviceState.hasTouch = touchEnabled -- Store actual touch capability
+		DeviceState.hasKeyboard = keyboardEnabled
+		DeviceState.hasMouse = mouseEnabled
+		DeviceState.hasGamepad = gamepadEnabled
+	end
+
+	-- Return the *potential* mobile status for UI setup purposes
+	-- Use isRealMobileDevice for logic that depends on the *intended* platform behavior
+	return platformType, isMobile
+end
+
+--// UI Setup //--
+function MobileController:SetupUI()
+	if setupInProgress then
+		debugPrint("SetupUI: Already in progress, skipping.")
+		return nil -- Return nil indicating setup didn't run or complete here
+	end
+
+	-- Debounce setup calls
+	local currentTime = tick()
+	if currentTime - lastSetupTime < 0.5 then
+		debugPrint("SetupUI: Called too rapidly, skipping.")
+		return nil
+	end
+	lastSetupTime = currentTime
+	setupInProgress = true -- Mark setup as started
+	isUISetup = false -- Assume setup is not complete until the end
+
+	-- Get Player and PlayerGui safely
+	local player = Players.LocalPlayer
+	-- Removed redundant wait here, WaitForChild used below if needed
+	if not player then
+		warn("SetupUI: Cannot proceed, LocalPlayer not found.")
+		setupInProgress = false
+		return nil
+	end
+
+	local playerGui = player:FindFirstChildOfClass("PlayerGui")
+	if not playerGui then
+		debugPrint("SetupUI: PlayerGui not found initially, waiting...")
+		playerGui = player:WaitForChild("PlayerGui", SETTINGS.RESILIENCE.SETUP_TIMEOUT)
+	end
+	if not playerGui then
+		warn("SetupUI: Cannot proceed, PlayerGui not found or timed out.")
+		setupInProgress = false
+		return nil
+	end
+
+	-- DOKUNMATIK EKRAN VARSA, PLATFORM KONTROLÜ YAPMA, DIREKT KABULLEN
+	local platformCheckRequired = true
+
+	-- Dokunmatik ekran algılandıysa, platform kontrolünü atla
+	if UserInputService.TouchEnabled and not RunService:IsStudio() then
+		debugPrint("SetupUI: Touch enabled detected, bypassing platform check!")
+		platformCheckRequired = false
+		-- Dokunmatik algılandığında cihazı mobile olarak işaretle
+		DeviceState.isRealMobileDevice = true
+		DeviceState.currentPlatform = "Mobile"
+		DeviceState.lastActiveDevice = "Mobile"
+		DeviceState.hasTouch = true
+	end
+
+	-- Normal platform kontrolü sadece dokunmatik olmadığında yapılır
+	if platformCheckRequired then
+		-- Re-detect platform; only proceed if mobile is required
+		local platformType, isMobile = self:DetectPlatform()
+		if not isMobile then
+			debugPrint("SetupUI: Platform is not mobile (", platformType, "), cancelling setup.")
+			local existingMBUI = playerGui:FindFirstChild("MB_UI")
+			if existingMBUI then
+				debugPrint("SetupUI: Removing existing MB_UI for non-mobile platform.")
+				existingMBUI:Destroy()
+			end
+			mobileFrame = nil -- Clear reference
+			setupInProgress = false
+			return nil -- Return nil as setup was cancelled
+		end
+		debugPrint("SetupUI: Proceeding for mobile platform (", platformType, ")")
+	end
+
+	-- Find or create the main ScreenGui (MB_UI)
+	local mbUI = playerGui:FindFirstChild("MB_UI")
+	if not mbUI then
+		debugPrint("SetupUI: Creating new MB_UI ScreenGui.")
+		mbUI = Instance.new("ScreenGui")
+		mbUI.Name = "MB_UI"
+		mbUI.ResetOnSpawn = false
+		mbUI.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+		mbUI.DisplayOrder = 10
+		mbUI.Parent = playerGui
+	elseif not mbUI:IsA("ScreenGui") then
+		warn("SetupUI: Found existing MB_UI, but it's not a ScreenGui. Replacing.")
+		mbUI:Destroy()
+		mbUI = Instance.new("ScreenGui")
+		mbUI.Name = "MB_UI"; mbUI.ResetOnSpawn = false; mbUI.ZIndexBehavior = Enum.ZIndexBehavior.Sibling; mbUI.DisplayOrder = 10; mbUI.Parent = playerGui;
+	elseif mbUI.ResetOnSpawn then
+		debugPrint("SetupUI: Correcting ResetOnSpawn on existing MB_UI to false.")
+		mbUI.ResetOnSpawn = false
+	end
+
+	-- Find the MobileFrame template
+	local originalFrame = ReplicatedFirst:FindFirstChild("MobileFrame")
+		or ReplicatedStorage:FindFirstChild("MobileFrame")
+		or (ReplicatedStorage:FindFirstChild("SharedModules") and ReplicatedStorage.SharedModules:FindFirstChild("MobileFrame"))
+		or StarterGui:FindFirstChild("MobileFrame")
+
+	if not originalFrame then
+		warn("SetupUI: FAILED - MobileFrame template not found!")
+		setupInProgress = false
+		return nil -- Return nil as template is missing
+	end
+
+	-- Remove any existing MobileFrame before cloning
+	local existingFrame = mbUI:FindFirstChild("MobileFrame")
+	if existingFrame then
+		debugPrint("SetupUI: Removing existing MobileFrame before cloning.")
+		existingFrame:Destroy()
+	end
+
+	-- Clone the template and update the module's reference
+	debugPrint("SetupUI: Cloning MobileFrame template.")
+	mobileFrame = originalFrame:Clone() -- Update module variable directly
+	mobileFrame.GroupTransparency = 1 -- Start fully transparent
+	mobileFrame.Visible = true -- Needs to be visible for transparency tween
+	mobileFrame.Parent = mbUI
+
+	-- Ensure UIScale exists and reset its scale
+	local uiScale = mobileFrame:FindFirstChildOfClass("UIScale")
+	if not uiScale then
+		uiScale = Instance.new("UIScale")
+		uiScale.Name = "MobileControllerScale"
+		uiScale.Parent = mobileFrame
+	end
+	uiScale.Scale = 1.0 -- Reset scale
+
+	-- Cache tweens if setting is enabled
+	if SETTINGS.PERFORMANCE.PRE_CACHE_TWEENS then
+		self:PreCacheTweens(mobileFrame)
+	end
+
+	-- Find the InputEvents module
+	inputEvents = self:FindInputEvents() -- Update module variable
+	if not inputEvents then
+		warn("SetupUI: InputEvents module not found. Button actions may not work.")
+	end
+
+	-- Setup button connections and logic
+	local success, err = pcall(function()
+		self:SetupButtonFunctionality(mobileFrame)
+	end)
+	if not success then
+		warn("SetupUI: Error during SetupButtonFunctionality:", err)
+		-- Continue setup even if buttons fail? Yes, UI structure is still set up.
+	end
+
+	-- Mark setup as complete *logically*
+	isUISetup = true
+	setupInProgress = false
+	debugPrint("SetupUI: Mobile UI successfully configured (logical setup complete).")
+
+	-- !! REMOVED: self:UpdateUIBasedOnDeviceState(true) !!
+	-- Visibility is now handled by the caller (Initialize or WatchCharacterLifecycle)
+
+	return mobileFrame -- Return the newly created/found frame
+end
+
+--// Tween Caching //--
+function MobileController:PreCacheTweens(frame)
+	if not frame or not frame.Parent then return end
+
+	local runButton = frame:FindFirstChild("RunButton")
+	local dashButton = frame:FindFirstChild("DashButton")
+	local jumpButton = frame:FindFirstChild("JumpButton")
+
+	-- Helper to create tweens based on settings from AnimationManager
+	local function createTween(instance, config)
+		local info = TweenInfo.new(
+			config.Duration,
+			config.EasingStyle or Enum.EasingStyle.Quad,
+			config.EasingDirection or Enum.EasingDirection.Out
+		)
+		return TweenService:Create(instance, info, config.Goal)
+	end
+
+	-- Clear existing cached tweens
+	cachedTweens = {}
+
+	if runButton then
+		-- RunButton tweenleri
+		cachedTweens.runPress = createTween(runButton, {
+			Duration = AnimationManager.CONFIG.BUTTON.RUN.PRESS_ANIMATION_DURATION,
+			Goal = { Size = AnimationManager.CONFIG.BUTTON.RUN.PRESSED_SIZE }
+		})
+		cachedTweens.runRelease = createTween(runButton, {
+			Duration = AnimationManager.CONFIG.BUTTON.RUN.RELEASE_ANIMATION_DURATION,
+			Goal = { Size = AnimationManager.CONFIG.BUTTON.RUN.DEFAULT_SIZE }
+		})
+	end
+
+	if dashButton then
+		cachedTweens.dashPress = createTween(dashButton, {
+			Duration = AnimationManager.CONFIG.BUTTON.DASH.PRESS_ANIMATION_DURATION,
+			Goal = { Size = AnimationManager.CONFIG.BUTTON.DASH.PRESSED_SIZE }
+		})
+		cachedTweens.dashRelease = createTween(dashButton, {
+			Duration = AnimationManager.CONFIG.BUTTON.DASH.RELEASE_ANIMATION_DURATION,
+			Goal = { Size = AnimationManager.CONFIG.BUTTON.DASH.DEFAULT_SIZE }
+		})
+	end
+
+	if jumpButton then
+		cachedTweens.jumpPress = createTween(jumpButton, {
+			Duration = AnimationManager.CONFIG.BUTTON.JUMP.PRESS_ANIMATION_DURATION,
+			Goal = {
+				Size = AnimationManager.CONFIG.BUTTON.JUMP.PRESSED_SIZE,
+				ImageColor3 = AnimationManager.CONFIG.BUTTON.JUMP.PRESSED_COLOR
+			}
+		})
+		cachedTweens.jumpRelease = createTween(jumpButton, {
+			Duration = AnimationManager.CONFIG.BUTTON.JUMP.RELEASE_ANIMATION_DURATION,
+			Goal = {
+				Size = AnimationManager.CONFIG.BUTTON.JUMP.DEFAULT_SIZE,
+				ImageColor3 = AnimationManager.CONFIG.BUTTON.JUMP.DEFAULT_COLOR
+			}
+		})
+	end
+
+	debugPrint("PreCacheTweens: Button animation tweens cached.")
+end
+
+--// Transition Management //--
+function MobileController:CancelTransitions()
+	local success, errorMsg = pcall(function()
+		-- Transition state reset
+		DeviceState.isTransitioning = false
+		DeviceState.frameVisibilityTween = nil
+		DeviceState.scaleVisibilityTween = nil
+
+		-- CRITICAL: Force reset UIScale to 1 when transitions are cancelled
+		if mobileFrame and mobileFrame.Parent then
+			local uiScale = mobileFrame:FindFirstChildOfClass("UIScale")
+			if uiScale then
+				uiScale.Scale = 1.0
+			end
+		end
+	end)
+
+	if not success then
+		warn("CancelTransitions: Error during cancellation:", errorMsg)
+		-- Ensure state is reset even on error
+		DeviceState.isTransitioning = false
+		DeviceState.frameVisibilityTween = nil
+		DeviceState.scaleVisibilityTween = nil
+		if mobileFrame and mobileFrame.Parent then
+			local uiScale = mobileFrame:FindFirstChildOfClass("UIScale")
+			if uiScale then uiScale.Scale = 1.0 end -- Force reset scale
+		end
+	end
+end
+
+-- Shows the mobile UI with improved animation.
+function MobileController:ShowMobileUI(callback)
+	if not mobileFrame or not mobileFrame.Parent then
+		debugPrint("ShowMobileUI: Cannot show, mobileFrame is missing or invalid.")
+		if callback then task.spawn(callback) end
+		return
+	end
+
+	-- Check if already visible and not transitioning
+	if mobileFrame.Visible and mobileFrame.GroupTransparency == 0 and not DeviceState.isTransitioning then
+		local uiScaleCheck = mobileFrame:FindFirstChildOfClass("UIScale")
+		if uiScaleCheck and math.abs(uiScaleCheck.Scale - 1.0) < 0.01 then
+			-- Already in the correct state
+			if callback then task.spawn(callback) end
+			return
+		end
+	end
+
+	debugPrint("ShowMobileUI: Starting show animation.")
+	self:CancelTransitions() -- Cancel any previous transition first
+	DeviceState.isTransitioning = true -- Mark as transitioning
+
+	-- BasitleştirilGmiş AnimationManager kullan
+	AnimationManager:ShowUI(mobileFrame, function()
+		DeviceState.isTransitioning = false
+		DeviceState.frameVisibilityTween = nil
+		DeviceState.scaleVisibilityTween = nil
+
+		-- Ensure final state manually
+		if mobileFrame and mobileFrame.Parent then
+			mobileFrame.GroupTransparency = 0
+			local uiScale = mobileFrame:FindFirstChildOfClass("UIScale")
+			if uiScale then uiScale.Scale = 1.0 end
+		end
+
+		if callback then task.spawn(callback) end
+	end)
+end
+
+-- Hides the mobile UI with improved animation.
+function MobileController:HideMobileUI(callback)
+	if not mobileFrame or not mobileFrame.Parent or not mobileFrame.Visible then
+		-- Already hidden or invalid frame
+		if callback then task.spawn(callback) end
+		return
+	end
+
+	-- Check if already hidden and not transitioning
+	if mobileFrame.GroupTransparency == 1 and not DeviceState.isTransitioning then
+		-- Already in the correct state
+		if callback then task.spawn(callback) end
+		return
+	end
+
+	debugPrint("HideMobileUI: Starting hide animation.")
+	self:CancelTransitions() -- Cancel any previous transition first
+	DeviceState.isTransitioning = true -- Mark as transitioning
+
+	-- Reset button toggle states before hiding
+	self:ResetAllToggleStates()
+
+	-- AnimationManager kullan
+	AnimationManager:HideUI(mobileFrame, function()
+		DeviceState.isTransitioning = false
+		DeviceState.frameVisibilityTween = nil
+		DeviceState.scaleVisibilityTween = nil
+
+		-- Ensure final state manually
+		if mobileFrame and mobileFrame.Parent then
+			mobileFrame.Visible = false
+			mobileFrame.GroupTransparency = 1
+			local uiScale = mobileFrame:FindFirstChildOfClass("UIScale")
+			if uiScale then uiScale.Scale = 1.0 end
+		end
+
+		if callback then task.spawn(callback) end
+	end)
+end
+
+--// UpdateUIBasedOnDeviceState //--
+function MobileController:UpdateUIBasedOnDeviceState(instant)
+	-- DOKUNMATIK KONTROLÜ: Dokunmatik varsa, her zaman görünür olmalı
+	local forceTouchVisibility = UserInputService.TouchEnabled and not RunService:IsStudio()
+
+	-- Ensure UI is actually set up before trying to update visibility
+	if not isUISetup or not mobileFrame or not mobileFrame.Parent then
+		-- If UI isn't set up, but should be (mobile platform detected or touch enabled), try setting it up now.
+		if (DeviceState.isRealMobileDevice or forceTouchVisibility) and not setupInProgress then
+			debugPrint("UpdateUIBasedOnDeviceState: UI not ready, but should be (mobile or touch). Attempting setup.")
+			self:SetupUI() -- Try to set it up
+			-- SetupUI will handle the initial visibility update if successful.
+
+			-- Dokunmatik nedeniyle zorla görünür yap
+			if forceTouchVisibility and mobileFrame and mobileFrame.Parent then
+				mobileFrame.Visible = true
+				mobileFrame.GroupTransparency = 0
+				local uiScale = mobileFrame:FindFirstChildOfClass("UIScale")
+				if uiScale then uiScale.Scale = 1.0 end
+				debugPrint("UpdateUIBasedOnDeviceState: Force showing UI due to touch detection.")
+			end
+		else
+			debugPrint("UpdateUIBasedOnDeviceState: UI not ready or setup in progress, cannot update visibility yet.")
+		end
+		return
+	end
+
+	local targetDevice = DeviceState.lastActiveDevice
+	debugPrint("UpdateUIBasedOnDeviceState: Updating UI for Target Device:", targetDevice, "| Instant:", instant)
+
+	-- GÖRÜNÜRLÜK KONTROLÜ: "Mobile" cihaz VEYA dokunmatik ekran varsa görünür olmalı
+	local shouldBeVisible = (targetDevice == "Mobile" and DeviceState.isRealMobileDevice) or forceTouchVisibility
+
+	-- Eğer klavye/fare/gamepad girişlerinde, dokunmatik varsa bile gizlenme seçeneği ekleyelim
+	if targetDevice == "Keyboard" or targetDevice == "Gamepad" then
+		-- Dokunmatik varsa bile klavye/gamepad kullanılıyorsa gizlenmeyi değerlendir
+		if not DeviceState.hasTouch or (DeviceState.lastDeviceSwitchTime > 0 and tick() - DeviceState.lastDeviceSwitchTime < 5) then
+			shouldBeVisible = false
+		end
+	end
+
+	if shouldBeVisible then
+		-- Show UI
+		-- Check if it's already visible and not transitioning to avoid redundant calls
+		if mobileFrame.Visible and mobileFrame.GroupTransparency == 0 and not DeviceState.isTransitioning then
+			local uiScale = mobileFrame:FindFirstChildOfClass("UIScale")
+			if uiScale and math.abs(uiScale.Scale - 1.0) < 0.01 then
+				debugPrint("UpdateUIBasedOnDeviceState: UI should be visible and already is. No change.")
+				return -- Already in the desired state
+			end
+		end
+
+		debugPrint("UpdateUIBasedOnDeviceState: Showing UI. Instant:", instant)
+		if instant then
+			self:CancelTransitions()
+			-- Ensure parent still exists before modifying
+			if mobileFrame and mobileFrame.Parent then
+				mobileFrame.Visible = true
+				mobileFrame.GroupTransparency = 0
+				local uiScale = mobileFrame:FindFirstChildOfClass("UIScale")
+				if uiScale then uiScale.Scale = 1.0 end
+				debugPrint("UpdateUIBasedOnDeviceState: UI shown instantly.")
+			else
+				debugPrint("UpdateUIBasedOnDeviceState: Cannot show instantly, mobileFrame lost parent.")
+			end
+		else
+			self:ShowMobileUI() -- Show with animation
+		end
+	else
+		-- Hide UI (for Gamepad or Keyboard, or if platform isn't mobile)
+		-- Check if it's already hidden or hiding to avoid redundant calls
+		if (not mobileFrame.Visible or mobileFrame.GroupTransparency == 1) and not DeviceState.isTransitioning then
+			debugPrint("UpdateUIBasedOnDeviceState: UI should be hidden and already is. No change.")
+			-- Ensure scale is reset even if hidden already
+			local uiScale = mobileFrame:FindFirstChildOfClass("UIScale")
+			if uiScale and uiScale.Scale ~= 1.0 then uiScale.Scale = 1.0 end
+			return -- Already hidden
+		end
+
+		debugPrint("UpdateUIBasedOnDeviceState: Hiding UI. Instant:", instant)
+		if instant then
+			self:CancelTransitions()
+			-- Ensure parent still exists before modifying
+			if mobileFrame and mobileFrame.Parent then
+				mobileFrame.Visible = false
+				mobileFrame.GroupTransparency = 1
+				local uiScale = mobileFrame:FindFirstChildOfClass("UIScale")
+				if uiScale then uiScale.Scale = 1.0 end -- Reset scale even when hidden instantly
+				debugPrint("UpdateUIBasedOnDeviceState: UI hidden instantly.")
+				-- Reset toggles instantly as well if hidden instantly
+				self:ResetAllToggleStates()
+			else
+				debugPrint("UpdateUIBasedOnDeviceState: Cannot hide instantly, mobileFrame lost parent.")
+			end
+		else
+			-- HideMobileUI already calls ResetAllToggleStates internally before animating
+			self:HideMobileUI() -- Hide with animation
+		end
+	end
+end
+
+--// Player State Check //--
+function MobileController:IsPlayerMoving()
+	local player = Players.LocalPlayer
+	-- Check player, character, character parent, and humanoid existence
+	if not player or not player.Character or not player.Character.Parent then return false end
+	local humanoid = player.Character:FindFirstChildOfClass("Humanoid")
+	if not humanoid then return false end
+
+	-- Check MoveDirection magnitude against threshold
+	return humanoid.MoveDirection.Magnitude > SETTINGS.FUNCTIONALITY.DASH.MINIMUM_MOVEMENT_THRESHOLD
+end
+
+--// External Module Finding //--
+function MobileController:FindInputEvents()
+	local player = Players.LocalPlayer
+	if not player then return nil end
+
+	local foundModule = nil
+	local moduleInstance = nil
+
+	-- Define potential search locations using functions for safety
+	local searchPaths = {
+		-- Character scripts (often highest priority if present)
+		function() return player.Character and player.Character:FindFirstChild("Scripts", true) and player.Character.Scripts:FindFirstChild("Client", true) and player.Character.Scripts.Client:FindFirstChild("Components", true) and player.Character.Scripts.Client.Components:FindFirstChild("InputEvents") end,
+		-- Shared module locations
+		function() return ReplicatedStorage:FindFirstChild("Modules", true) and ReplicatedStorage.Modules:FindFirstChild("InputEvents") end,
+		function() return ReplicatedStorage:FindFirstChild("SharedModules", true) and ReplicatedStorage.SharedModules:FindFirstChild("InputEvents") end,
+		-- Player script locations
+		function() return game:GetService("StarterPlayer").StarterPlayerScripts:FindFirstChild("InputEvents") end,
+		function() return game:GetService("StarterPlayer").StarterCharacterScripts:FindFirstChild("InputEvents") end
+	}
+
+	-- Iterate through search paths
+	for _, finderFunc in ipairs(searchPaths) do
+		local success, module = pcall(finderFunc) -- Use pcall for safety accessing character potentially
+		if success and module and module:IsA("ModuleScript") then
+			debugPrint("FindInputEvents: Module found at:", module:GetFullName())
+			moduleInstance = module
+			break -- Stop searching once found
+		end
+	end
+
+	-- If found, attempt to require it safely
+	if moduleInstance then
+		foundModule = safeRequire(moduleInstance)
+		if not foundModule then
+			warn("FindInputEvents: Found module but failed to require:", moduleInstance:GetFullName())
+		end
+	else
+		debugPrint("FindInputEvents: Module 'InputEvents' not found in any standard location.")
+	end
+
+	return foundModule -- Returns the required module or nil
+end
+
+--// Button State Reset //--
+function MobileController:ResetAllToggleStates()
+	if not mobileFrame or not mobileFrame.Parent then
+		return -- No UI to reset
+	end
+
+	local success, errorMsg = pcall(function()
+		-- Reset internal state variables
+		isRunning = false
+		isDashOnCooldown = false
+
+		-- Find buttons
+		local runButton = mobileFrame:FindFirstChild("RunButton")
+		local dashButton = mobileFrame:FindFirstChild("DashButton")
+		local jumpButton = mobileFrame:FindFirstChild("JumpButton")
+
+		-- Reset Run Button visuals
+		if runButton then
+			runButton.ImageColor3 = AnimationManager.CONFIG.BUTTON.RUN.TOGGLE_OFF_COLOR
+			runButton.Size = AnimationManager.CONFIG.BUTTON.RUN.DEFAULT_SIZE
+			local btnTitle = runButton:FindFirstChild("btn_title")
+			if btnTitle and btnTitle:IsA("TextLabel") then 
+				btnTitle.TextColor3 = AnimationManager.CONFIG.BUTTON.RUN.TOGGLE_OFF_COLOR 
+			end
+			local btnFlash = runButton:FindFirstChild("btn_flash")
+			if btnFlash then 
+				btnFlash.Visible = false
+				btnFlash.BackgroundTransparency = AnimationManager.CONFIG.BUTTON.BTN_FLASH.MAX_TRANSPARENCY
+			end
+		end
+
+		-- Reset Dash Button visuals and cooldown state
+		if dashButton then
+			dashButton.Size = AnimationManager.CONFIG.BUTTON.DASH.DEFAULT_SIZE
+			local canvas = dashButton:FindFirstChild("canvas")
+			if canvas then
+				canvas.Visible = false -- Hide cooldown overlay
+				local cooldownFill = canvas:FindFirstChild("CooldownFill")
+				if cooldownFill then cooldownFill.Size = AnimationManager.CONFIG.COOLDOWN.FILL_START_SIZE end
+				local titleLabel = canvas:FindFirstChild("title")
+				if titleLabel and titleLabel:IsA("TextLabel") then titleLabel.Text = "" end -- Clear timer text
+			end
+			local btnFlash = dashButton:FindFirstChild("btn_flash")
+			if btnFlash then 
+				btnFlash.Visible = false
+				btnFlash.BackgroundTransparency = AnimationManager.CONFIG.BUTTON.BTN_FLASH.MAX_TRANSPARENCY
+			end
+
+			-- Stop any active dash cooldown Heartbeat connection
+			if dashCooldownConnection and dashCooldownConnection.Connected then
+				dashCooldownConnection:Disconnect()
+				dashCooldownConnection = nil
+				debugPrint("ResetAllToggleStates: Disconnected active Dash cooldown.")
+			end
+		end
+
+		-- Reset Jump Button visuals
+		if jumpButton then
+			jumpButton.ImageColor3 = AnimationManager.CONFIG.BUTTON.JUMP.DEFAULT_COLOR
+			jumpButton.Size = AnimationManager.CONFIG.BUTTON.JUMP.DEFAULT_SIZE
+			local btnFlash = jumpButton:FindFirstChild("btn_flash")
+			if btnFlash then 
+				btnFlash.Visible = false
+				btnFlash.BackgroundTransparency = AnimationManager.CONFIG.BUTTON.BTN_FLASH.MAX_TRANSPARENCY
+			end
+
+			-- Stop any active jump hold Heartbeat connection
+			if jumpHoldConnection and jumpHoldConnection.Connected then
+				jumpHoldConnection:Disconnect()
+				jumpHoldConnection = nil
+				debugPrint("ResetAllToggleStates: Disconnected active Jump hold.")
+			end
+		end
+
+		-- Notify InputEvents module to reset sprint/jump states
+		if inputEvents and inputEvents.Mobile then
+			if inputEvents.Mobile.Sprint then pcall(inputEvents.Mobile.Sprint, false) end
+			if inputEvents.Mobile.Jump then pcall(inputEvents.Mobile.Jump, false) end
+		end
+	end)
+
+	if not success then
+		warn("ResetAllToggleStates: Error occurred:", errorMsg)
+	end
+end
+
+--// Button Setup Functions //--
+function MobileController:SetupJumpButton(button)
+	if not button then return end
+
+	local btnFlash = button:FindFirstChild("btn_flash")
+	if btnFlash then btnFlash.Visible = false end
+
+	-- Buton ayarları
+	local CONFIG = AnimationManager.CONFIG.BUTTON.JUMP
+
+	-- Reset state
+	button.ImageColor3 = CONFIG.DEFAULT_COLOR
+	button.Size = CONFIG.DEFAULT_SIZE
+
+	local isJumpButtonPressed = false
+	local isJumpHoldCooldownActive = false
+
+	-- Jump hold function
+	local function handleJumpHold()
+		-- Clean up previous connection if any
+		if jumpHoldConnection and jumpHoldConnection.Connected then jumpHoldConnection:Disconnect() end
+		jumpHoldConnection = nil
+
+		if SETTINGS.FUNCTIONALITY.JUMP.ALLOW_HOLD_JUMP and isJumpButtonPressed then
+			debugPrint("SetupJumpButton: Starting Jump hold Heartbeat.")
+			jumpHoldConnection = RunService.Heartbeat:Connect(function()
+				-- Safety checks inside Heartbeat
+				local player = Players.LocalPlayer
+				if not player or not player.Character or not player.Character.Parent or not button or not button.Parent then
+					if jumpHoldConnection and jumpHoldConnection.Connected then jumpHoldConnection:Disconnect() end
+					jumpHoldConnection = nil
+					return
+				end
+
+				-- Trigger jump if button held and not on hold cooldown
+				if isJumpButtonPressed and not isJumpHoldCooldownActive then
+					if inputEvents and inputEvents.Mobile and inputEvents.Mobile.Jump then
+						local success, err = pcall(inputEvents.Mobile.Jump, true) -- Hold jump event
+						if not success then warn("SetupJumpButton: Error calling inputEvents.Mobile.Jump(true):", err) end
+
+						-- Start hold cooldown
+						isJumpHoldCooldownActive = true
+						task.delay(SETTINGS.FUNCTIONALITY.JUMP.COOLDOWN_DURATION, function()
+							isJumpHoldCooldownActive = false
+						end)
+					end
+				end
+			end)
+		end
+	end
+
+	-- Jump release function
+	local function releaseJump()
+		if not isJumpButtonPressed then return end -- Avoid redundant calls
+		isJumpButtonPressed = false
+
+		-- Clean up jump hold connection
+		if jumpHoldConnection and jumpHoldConnection.Connected then
+			jumpHoldConnection:Disconnect()
+			jumpHoldConnection = nil
+			debugPrint("SetupJumpButton: Jump hold Heartbeat stopped on release.")
+		end
+
+		-- Play release animation with color transition
+		AnimationManager:AnimateButtonRelease(button, CONFIG.DEFAULT_SIZE):Play()
+
+		-- Smooth renk geçişi
+		AnimationManager:AnimateColorChange(button, CONFIG.DEFAULT_COLOR):Play()
+
+		-- Notify InputEvents that jump is released
+		if inputEvents and inputEvents.Mobile and inputEvents.Mobile.Jump then
+			local success, err = pcall(inputEvents.Mobile.Jump, false) -- Release jump event
+			if not success then warn("SetupJumpButton: Error calling inputEvents.Mobile.Jump(false):", err) end
+		end
+	end
+
+	-- Connect events
+	button.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			isJumpButtonPressed = true
+
+			-- btn_flash görünür yap
+			if btnFlash then
+				btnFlash.Visible = true
+				btnFlash.BackgroundTransparency = AnimationManager.CONFIG.BUTTON.BTN_FLASH.MIN_TRANSPARENCY
+			end
+
+			-- Press animation with color transition
+			AnimationManager:AnimateButtonPress(button, CONFIG.DEFAULT_SIZE, CONFIG.PRESSED_SIZE):Play()
+
+			-- Smooth renk geçişi
+			AnimationManager:AnimateColorChange(button, CONFIG.PRESSED_COLOR):Play()
+
+			-- Trigger initial jump press
+			if inputEvents and inputEvents.Mobile and inputEvents.Mobile.Jump then
+				local success, err = pcall(inputEvents.Mobile.Jump, true) -- Initial jump press event
+				if not success then warn("SetupJumpButton: Error calling inputEvents.Mobile.Jump(true) on press:", err) end
+				handleJumpHold() -- Start hold logic if enabled
+			else
+				debugPrint("SetupJumpButton: InputEvents.Mobile.Jump not available.")
+			end
+		end
+	end)
+
+	button.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			releaseJump()
+		end
+	end)
+
+	-- Handle mouse leaving button area while pressed
+	button.MouseLeave:Connect(function()
+		if isJumpButtonPressed and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
+			releaseJump()
+		end
+	end)
+end
+
+-- Sets up the Run button logic (toggle).
+function MobileController:SetupRunButton(button)
+	if not button then return end
+
+	local buttonTitle = button:FindFirstChild("btn_title")
+	local btnFlash = button:FindFirstChild("btn_flash")
+	if btnFlash then btnFlash.Visible = false end
+
+	-- Durum değişkenleri
+	local isRunning = false
+	local isButtonDown = false
+	local lastClickTime = 0
+	local toggleDebounce = false
+
+	-- Buton ayarları
+	local CONFIG = AnimationManager.CONFIG.BUTTON.RUN
+
+	-- Reset to initial state
+	button.ImageColor3 = CONFIG.TOGGLE_OFF_COLOR
+	button.Size = CONFIG.DEFAULT_SIZE
+	if buttonTitle and buttonTitle:IsA("TextLabel") then
+		buttonTitle.TextColor3 = CONFIG.TOGGLE_OFF_COLOR
+	end
+
+	-- Toggle function with smooth color transitions
+	local function toggleRunningState()
+		if toggleDebounce then return end
+		toggleDebounce = true
+
+		-- Durumu değiştir
+		isRunning = not isRunning
+
+		-- btn_flash efekti (basma/bırakma göstergesi)
+		if btnFlash then
+			AnimationManager:ShowButtonFlash(button)
+		end
+
+		-- Hedef renk
+		local targetColor = isRunning and CONFIG.TOGGLE_ON_COLOR or CONFIG.TOGGLE_OFF_COLOR
+
+		-- Renk geçiş animasyonu - Smooth geçiş
+		AnimationManager:AnimateColorChange(button, targetColor):Play()
+
+		-- Başlık renk geçişi (varsa)
+		if buttonTitle and buttonTitle:IsA("TextLabel") then
+			AnimationManager:AnimateColorChange(buttonTitle, targetColor):Play()
+		end
+
+		-- InputEvents'i bilgilendir
+		if inputEvents and inputEvents.Mobile and inputEvents.Mobile.Sprint then
+			local success, err = pcall(function()
+				inputEvents.Mobile.Sprint(isRunning)
+			end)
+			if not success then
+				warn("SetupRunButton: Error calling inputEvents.Mobile.Sprint:", err)
+			end
+		end
+
+		-- Debounce reset
+		task.delay(0.25, function()
+			toggleDebounce = false
+		end)
+	end
+
+	-- MouseButton Events
+	button.MouseButton1Down:Connect(function()
+		-- Debounce kontrolü
+		local now = tick()
+		if now - lastClickTime < 0.2 then return end
+		lastClickTime = now
+		isButtonDown = true
+
+		-- btn_flash görünür yap
+		if btnFlash then
+			btnFlash.Visible = true
+			btnFlash.BackgroundTransparency = AnimationManager.CONFIG.BUTTON.BTN_FLASH.MIN_TRANSPARENCY
+		end
+
+		-- Basma animasyonu
+		AnimationManager:AnimateButtonPress(button, CONFIG.DEFAULT_SIZE, CONFIG.PRESSED_SIZE):Play()
+	end)
+
+	button.MouseButton1Up:Connect(function()
+		if not isButtonDown then return end
+		isButtonDown = false
+
+		-- Bırakma animasyonu
+		AnimationManager:AnimateButtonRelease(button, CONFIG.DEFAULT_SIZE):Play()
+
+		-- Toggle durumunu değiştir
+		toggleRunningState()
+	end)
+
+	-- Mobil için Touch olayları
+	button.TouchTap:Connect(function(_, processed)
+		if processed then return end
+
+		-- Debounce kontrolü
+		local now = tick()
+		if now - lastClickTime < 0.2 then return end
+		lastClickTime = now
+
+		-- btn_flash görünür yap
+		if btnFlash then
+			btnFlash.Visible = true
+			btnFlash.BackgroundTransparency = AnimationManager.CONFIG.BUTTON.BTN_FLASH.MIN_TRANSPARENCY
+		end
+
+		-- Basma animasyonu ve sonra bırakma animasyonu
+		local pressTween = AnimationManager:AnimateButtonPress(button, CONFIG.DEFAULT_SIZE, CONFIG.PRESSED_SIZE)
+		pressTween:Play()
+
+		task.delay(CONFIG.PRESS_ANIMATION_DURATION, function()
+			AnimationManager:AnimateButtonRelease(button, CONFIG.DEFAULT_SIZE):Play()
+
+			-- Toggle durumunu değiştir
+			toggleRunningState()
+		end)
+	end)
+
+	-- MouseLeave temizliği
+	button.MouseLeave:Connect(function()
+		if isButtonDown and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
+			isButtonDown = false
+
+			-- Bırakma animasyonu
+			AnimationManager:AnimateButtonRelease(button, CONFIG.DEFAULT_SIZE):Play()
+		end
+	end)
+end
+
+-- Sets up the Dash button logic and cooldown.
+function MobileController:SetupDashButton(button)
+	if not button then warn("SetupDashButton: Dash button instance not found."); return end
+
+	-- Find UI elements
+	local canvas = button:FindFirstChild("canvas")
+	local cooldownFill = canvas and canvas:FindFirstChild("CooldownFill")
+	local titleLabel = canvas and canvas:FindFirstChild("title")
+	local btnFlash = button:FindFirstChild("btn_flash")
+
+	-- Buton ayarları
+	local CONFIG = AnimationManager.CONFIG.BUTTON.DASH
+	local COOLDOWN_CONFIG = AnimationManager.CONFIG.COOLDOWN
+
+	-- Initial setup
+	if btnFlash then btnFlash.Visible = false end
+	if canvas then canvas.Visible = false end -- Hide cooldown initially
+	if cooldownFill then cooldownFill.Size = COOLDOWN_CONFIG.FILL_START_SIZE end
+	if titleLabel and titleLabel:IsA("TextLabel") then titleLabel.Text = "" end
+
+	if not canvas or not cooldownFill or not titleLabel then
+		warn("SetupDashButton: Missing required child elements (canvas, CooldownFill, title).")
+	end
+
+	local lastClickTime = 0
+	local isBeingPressed = false -- Is the button currently held down?
+	isDashOnCooldown = false -- Reset cooldown state on setup
+
+	-- Function to trigger the dash action and start cooldown
+	local function triggerDash()
+		if isDashOnCooldown then
+			debugPrint("TriggerDash: Cooldown active, cannot dash.")
+			return false
+		end
+
+		-- Check movement requirement
+		if SETTINGS.FUNCTIONALITY.DASH.REQUIRES_MOVEMENT and not MobileController:IsPlayerMoving() then
+			debugPrint("TriggerDash: Movement required, player is not moving.")
+			return false
+		end
+
+		-- Call the actual dash event
+		if inputEvents and inputEvents.Mobile and inputEvents.Mobile.Dash then
+			local success, err = pcall(inputEvents.Mobile.Dash)
+			if not success then
+				warn("TriggerDash: Error calling inputEvents.Mobile.Dash:", err)
+				return false -- Don't start cooldown if the action failed
+			end
+			debugPrint("TriggerDash: Dash action successful.")
+
+			-- Start cooldown
+			isDashOnCooldown = true
+			if canvas then canvas.Visible = true end -- Show cooldown overlay
+
+			local timeLeft = SETTINGS.FUNCTIONALITY.DASH.COOLDOWN_DURATION
+			if titleLabel and titleLabel:IsA("TextLabel") then titleLabel.Text = tostring(math.ceil(timeLeft)) end
+			if cooldownFill then cooldownFill.Size = COOLDOWN_CONFIG.FILL_START_SIZE end
+
+			-- Clean up previous cooldown connection
+			if dashCooldownConnection and dashCooldownConnection.Connected then dashCooldownConnection:Disconnect() end
+			dashCooldownConnection = nil
+
+			-- Start Heartbeat for cooldown timer
+			debugPrint("SetupDashButton: Starting Dash cooldown Heartbeat.")
+			dashCooldownConnection = RunService.Heartbeat:Connect(function(deltaTime)
+				-- Safety checks
+				local player = Players.LocalPlayer
+				if not player or not player.Character or not player.Character.Parent or not button or not button.Parent then
+					if dashCooldownConnection and dashCooldownConnection.Connected then dashCooldownConnection:Disconnect() end
+					dashCooldownConnection = nil
+					if canvas then canvas.Visible = false end
+					isDashOnCooldown = false -- Reset state if character/button lost
+					return
+				end
+
+				timeLeft = math.max(0, timeLeft - deltaTime)
+
+				-- Update UI
+				if titleLabel and titleLabel:IsA("TextLabel") then titleLabel.Text = tostring(math.ceil(timeLeft)) end
+				if cooldownFill then
+					local fillRatio = timeLeft / SETTINGS.FUNCTIONALITY.DASH.COOLDOWN_DURATION
+					local startY = COOLDOWN_CONFIG.FILL_START_SIZE.Y.Offset
+					cooldownFill.Size = UDim2.new(0, COOLDOWN_CONFIG.FILL_START_SIZE.X.Offset, 0, startY * fillRatio)
+				end
+
+				-- Check if cooldown finished
+				if timeLeft <= 0 then
+					isDashOnCooldown = false
+					if canvas then canvas.Visible = false end
+					if dashCooldownConnection and dashCooldownConnection.Connected then dashCooldownConnection:Disconnect() end
+					dashCooldownConnection = nil
+					debugPrint("SetupDashButton: Dash cooldown finished.")
+				end
+			end)
+			return true -- Dash triggered successfully
+		else
+			warn("TriggerDash: InputEvents.Mobile.Dash not available.")
+			return false
+		end
+	end
+
+	-- Handle button press
+	button.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			isBeingPressed = true
+
+			-- Rapid click protection
+			if SETTINGS.FUNCTIONALITY.BUTTON_PROTECTION.PREVENT_RAPID_CLICKS then
+				local now = tick()
+				if now - lastClickTime < SETTINGS.FUNCTIONALITY.BUTTON_PROTECTION.RAPID_CLICK_THRESHOLD then return end
+				lastClickTime = now
+			end
+
+			-- Only animate and trigger if not on cooldown
+			if not isDashOnCooldown then
+				-- btn_flash görünür yap
+				if btnFlash then
+					btnFlash.Visible = true
+					btnFlash.BackgroundTransparency = AnimationManager.CONFIG.BUTTON.BTN_FLASH.MIN_TRANSPARENCY
+				end
+
+				-- Basitleştirilmiş animasyon kullan
+				AnimationManager:AnimateButtonPress(button, CONFIG.DEFAULT_SIZE, CONFIG.PRESSED_SIZE):Play()
+
+				triggerDash() -- Attempt to dash
+			else
+				debugPrint("SetupDashButton: InputBegan while on cooldown.")
+			end
+		end
+	end)
+
+	-- Handle button release
+	button.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			if not isBeingPressed then return end
+			isBeingPressed = false
+
+			-- Basitleştirilmiş animasyon kullan
+			AnimationManager:AnimateButtonRelease(button, CONFIG.DEFAULT_SIZE):Play()
+		end
+	end)
+
+	-- Handle mouse leaving while pressed
+	button.MouseLeave:Connect(function()
+		if isBeingPressed and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
+			if not isBeingPressed then return end
+			isBeingPressed = false
+
+			-- Basitleştirilmiş animasyon kullan
+			AnimationManager:AnimateButtonRelease(button, CONFIG.DEFAULT_SIZE):Play()
+		end
+	end)
+
+	debugPrint("SetupDashButton: Dash button setup complete.")
+end
+
+-- Orchestrates the setup of all individual buttons.
+function MobileController:SetupButtonFunctionality(frame)
+	if not frame or not frame.Parent then
+		warn("SetupButtonFunctionality: Invalid frame provided.")
+		return
+	end
+	debugPrint("SetupButtonFunctionality: Setting up button logic...")
+
+	-- Find buttons
+	local runButton = frame:FindFirstChild("RunButton")
+	local dashButton = frame:FindFirstChild("DashButton")
+	local jumpButton = frame:FindFirstChild("JumpButton")
+
+	-- Clean up any existing runtime connections before setting up new ones
+	self:CleanupCharacterRuntimeConnections()
+
+	-- Setup each button if found
+	if runButton then self:SetupRunButton(runButton) else warn("SetupButtonFunctionality: RunButton not found.") end
+	if dashButton then self:SetupDashButton(dashButton) else warn("SetupButtonFunctionality: DashButton not found.") end
+	if jumpButton then self:SetupJumpButton(jumpButton) else warn("SetupButtonFunctionality: JumpButton not found.") end
+
+	debugPrint("SetupButtonFunctionality: Button setup finished.")
+end
+
+-- Cleans up ALL connections related to character lifecycle (CharacterAdded/Removing, R key) AND runtime (Jump/Dash).
+function MobileController:CleanupCharacterConnections()
+	debugPrint("CleanupCharacterConnections: Cleaning up ALL character lifecycle and runtime connections...")
+	for _, conn in ipairs(characterConnections) do
+		if conn and conn.Connected then
+			pcall(function() conn:Disconnect() end) -- Safely disconnect
+		end
+	end
+	characterConnections = {} -- Clear the list
+	self:CleanupCharacterRuntimeConnections() -- Also clean runtime connections
+end
+
+-- Cleans up ONLY runtime connections (Jump Hold, Dash Cooldown Heartbeats).
+function MobileController:CleanupCharacterRuntimeConnections()
+	if jumpHoldConnection and jumpHoldConnection.Connected then
+		pcall(function() jumpHoldConnection:Disconnect() end)
+		jumpHoldConnection = nil
+		debugPrint("CleanupCharacterRuntimeConnections: Jump hold connection cleaned.")
+	end
+	if dashCooldownConnection and dashCooldownConnection.Connected then
+		pcall(function() dashCooldownConnection:Disconnect() end)
+		dashCooldownConnection = nil
+		debugPrint("CleanupCharacterRuntimeConnections: Dash cooldown connection cleaned.")
+	end
+end
+
+-- Cleans up ALL device tracking connections (UserInputService events).
+function MobileController:ClearDeviceConnections()
+	debugPrint("ClearDeviceConnections: Cleaning up device tracking connections...")
+	for _, conn in ipairs(deviceTrackingConnections) do
+		if conn and conn.Connected then
+			pcall(function() conn:Disconnect() end) -- Safely disconnect
+		end
+	end
+	deviceTrackingConnections = {} -- Clear the list
+
+	-- Also ensure character connections are cleaned (might be redundant but safe)
+	self:CleanupCharacterConnections()
+end
+
+--// Device Tracking Setup //--
+function MobileController:SetupDeviceTracking()
+	-- Clear any previous device tracking listeners first
+	self:ClearDeviceConnections()
+	debugPrint("SetupDeviceTracking: Starting setup...")
+
+	-- Ekran boyutu ve cihaz doğrulaması
+	local isSmallScreen = false
+	local isPortraitOrientation = false
+
+	local camera = workspace.CurrentCamera
+	if camera then
+		local viewportSize = camera.ViewportSize
+		isSmallScreen = viewportSize.X < 1024 or viewportSize.Y < 768
+		isPortraitOrientation = viewportSize.X / viewportSize.Y < 1.0
+	end
+
+	-- Ekran boyutuna göre mobil olabilir
+	if (isSmallScreen or isPortraitOrientation) and not RunService:IsStudio() then
+		debugPrint("SetupDeviceTracking: Mobile-like screen size detected, marking as potential mobile device")
+		DeviceState.isRealMobileDevice = true
+	end
+
+	-- Initial active device determination
+	local initialDevice = "Unknown"
+
+	if DeviceState.isRealMobileDevice then
+		initialDevice = "Mobile"
+		debugPrint("SetupDeviceTracking: Platform is Mobile. Defaulting initial device to Mobile.")
+	else
+		debugPrint("SetupDeviceTracking: Platform is not Mobile. Determining initial device based on peripherals.")
+		local hasAnyInput = false
+		if DeviceState.hasGamepad then
+			initialDevice = "Gamepad"
+			hasAnyInput = true
+		end
+		if DeviceState.hasKeyboard then -- Keyboard overrides gamepad for initial non-mobile UI state
+			initialDevice = "Keyboard"
+			hasAnyInput = true
+		elseif DeviceState.hasMouse and not hasAnyInput then -- Mouse alone also treated as desktop
+			initialDevice = "Keyboard"
+			hasAnyInput = true
+		end
+		-- If no prioritized input detected on non-mobile, default to Keyboard (hidden UI)
+		if initialDevice == "Unknown" then
+			initialDevice = "Keyboard"
+		end
+		debugPrint("SetupDeviceTracking: Non-Mobile platform. Initial device set to:", initialDevice)
+	end
+
+	-- Set initial active device if it's currently unknown or needs correction based on new logic
+	local needsInstantUpdate = false
+	if DeviceState.lastActiveDevice == "Unknown" or DeviceState.lastActiveDevice ~= initialDevice then
+		debugPrint("SetupDeviceTracking: Setting initial active device to:", initialDevice)
+		DeviceState.lastActiveDevice = initialDevice
+		needsInstantUpdate = true -- Flag that we might need an instant UI update
+	else
+		debugPrint("SetupDeviceTracking: Keeping existing active device:", DeviceState.lastActiveDevice)
+	end
+
+	-- Ensure UI state matches instantly on setup if an update is needed
+	if needsInstantUpdate then
+		-- Need to wait briefly for SetupUI potentially finishing if called concurrently
+		-- Also ensures the UI elements exist before trying to update them.
+		task.wait(0.1) -- Small delay
+		if isUISetup then
+			debugPrint("SetupDeviceTracking: Forcing instant UI update to match initial device state.")
+			self:UpdateUIBasedOnDeviceState(true) -- Force instant update based on initialDevice
+		else
+			debugPrint("SetupDeviceTracking: UI not ready yet for initial instant update.")
+		end
+	end
+
+	local lastInputTypeDetected = "None" -- For debugging
+
+	-- Central function to handle switching the active device
+	-- Returns true if switch occurred, false otherwise
+	local function AttemptSwitch(newDevice)
+		local now = tick()
+
+		if DeviceState.lastActiveDevice == newDevice then return false end -- Already the target
+
+		-- Allow switching away from Mobile during transition, otherwise block if transitioning
+		if DeviceState.isTransitioning and newDevice == "Mobile" then
+			debugPrint("AttemptSwitch: Blocked - Transitioning to Mobile.")
+			return false
+		end
+
+		-- Debounce checks (allow switching TO mobile via touch more readily)
+		if now - DeviceState.lastDeviceSwitchTime < SETTINGS.DEVICE_DETECTION.DEBOUNCE_TIME then
+			if not (newDevice == "Mobile" and DeviceState.isRealMobileDevice) then
+				debugPrint("AttemptSwitch: Blocked - Debounce.")
+				return false
+			else
+				debugPrint("AttemptSwitch: Debounce bypassed for switching TO Mobile via touch.")
+			end
+		end
+
+		debugPrint("SwitchActiveDevice: Changing active device:", DeviceState.lastActiveDevice, "->", newDevice)
+		local oldDevice = DeviceState.lastActiveDevice -- Store old device before changing
+		DeviceState.lastActiveDevice = newDevice
+		DeviceState.lastDeviceSwitchTime = now
+
+		-- If switching *away* from mobile, ensure transitions are cancelled first
+		-- This helps prevent conflicts if user spams inputs
+		if oldDevice == "Mobile" and newDevice ~= "Mobile" then
+			self:CancelTransitions()
+		end
+
+		-- Update the UI visibility (always use animation for switches triggered by input)
+		self:UpdateUIBasedOnDeviceState(false)
+		return true
+	end
+
+	-- Touch Input Handler Function (used by all touch events)
+	local function HandleTouchInput()
+		-- Studio'da dokunmatik kontrolü atlayabiliriz (test için gerekliyse FORCE_ENABLE_IN_STUDIO kullanılabilir)
+		if RunService:IsStudio() and not SETTINGS.GENERAL.FORCE_ENABLE_IN_STUDIO then
+			return
+		end
+
+		-- Eğer UI zaten kurulu ve görünürse işlem yapmayı atla
+		if isUISetup and mobileFrame and mobileFrame.Parent and mobileFrame.Visible and mobileFrame.GroupTransparency == 0 then
+			debugPrint("HandleTouchInput: MobileFrame zaten kurulu ve görünür durumda, işlem atlandi.")
+			return
+		end
+
+		debugPrint(">>> TOUCH DETECTED! Forcing mobile mode <<<")
+
+		-- Dokunmatik algılama = Mobil cihaz göstergesi
+		DeviceState.isRealMobileDevice = true
+		DeviceState.hasTouch = true
+		DeviceState.lastActiveDevice = "Mobile"
+
+		-- UI kurulu değilse, zorla kur
+		if not isUISetup or not mobileFrame or not mobileFrame.Parent then
+			debugPrint(">>> TOUCH HANDLER: MobileFrame not setup, FORCING SETUP <<<")
+
+			-- Cihazı "mobile" olarak kabul et ve UI'yı kur
+			self:SetupUI()
+
+			-- UI'yı görünür yap
+			if mobileFrame and mobileFrame.Parent then
+				self:CancelTransitions() -- Mevcut geçişleri iptal et
+				mobileFrame.Visible = true
+				mobileFrame.GroupTransparency = 0
+				local uiScale = mobileFrame:FindFirstChildOfClass("UIScale")
+				if uiScale then uiScale.Scale = 1.0 end
+				debugPrint(">>> TOUCH HANDLER: MobileFrame made visible <<<")
+			end
+		else
+			-- UI kurulu ancak görünür değilse, görünür yap
+			if mobileFrame and not mobileFrame.Visible then
+				debugPrint(">>> TOUCH HANDLER: MobileFrame exists but not visible, showing <<<")
+				self:CancelTransitions() -- Önceki geçişleri iptal et
+				mobileFrame.Visible = true
+				mobileFrame.GroupTransparency = 0
+				local uiScale = mobileFrame:FindFirstChildOfClass("UIScale")
+				if uiScale then uiScale.Scale = 1.0 end
+			end
+		end
+	end
+
+	-- TOUCH EVENT CONNECTIONS - YENİDEN DÜZENLENMİŞ VE DAHA AGRESİF
+	-- Her dokunmatik girişi tam olarak izlemek için 3 farklı olay dinleyici kullanıyoruz
+
+	-- TouchTap olayı
+	local touchTapConn = UserInputService.TouchTap:Connect(function(_, processedByUi)
+		if processedByUi then return end
+		HandleTouchInput()
+	end)
+	table.insert(deviceTrackingConnections, touchTapConn)
+
+	-- TouchStarted olayı
+	local touchStartConn = UserInputService.TouchStarted:Connect(function(_, processedByUi)
+		if processedByUi then return end
+		HandleTouchInput()
+	end)
+	table.insert(deviceTrackingConnections, touchStartConn)
+
+	-- InputChanged olayında dokunmatik giriş tespiti
+	local touchInputChangedConn = UserInputService.InputChanged:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.Touch then
+			HandleTouchInput()
+		end
+	end)
+	table.insert(deviceTrackingConnections, touchInputChangedConn)
+
+	-- Gamepad bağlantı olaylarını düzelt - SetupDeviceTracking fonksiyonu içindeki ilgili kısım
+	table.insert(deviceTrackingConnections, UserInputService.GamepadConnected:Connect(function(gamepad)
+		debugPrint("SetupDeviceTracking: Gamepad connected -", gamepad)
+		lastInputTypeDetected = "Gamepad"; DeviceState.hasGamepad = true
+
+		-- Bağlantıda hemen "Gamepad" moduna geç
+		DeviceState.lastActiveDevice = "Gamepad"
+
+		-- ÖNEMLİ: Show/Hide durumunu kontrol et ve önce Hide animasyonunu göster
+		if mobileFrame and mobileFrame.Parent then
+			-- Eğer gösterme geçişi devam ediyorsa iptal et
+			DeviceState.isTransitioning = false
+
+			-- UI'yi animasyonla gizle
+			MobileController:HideMobileUI()
+		end
+	end))
+
+	table.insert(deviceTrackingConnections, UserInputService.GamepadDisconnected:Connect(function(gamepad)
+		debugPrint("SetupDeviceTracking: Gamepad disconnected -", gamepad)
+		lastInputTypeDetected = "None"; DeviceState.hasGamepad = false
+		task.delay(SETTINGS.DEVICE_DETECTION.DOUBLE_CHECK_DELAY, function()
+			if not UserInputService.GamepadEnabled then
+				debugPrint("SetupDeviceTracking: Gamepad disconnect confirmed.")
+				-- If the currently active device WAS Gamepad, switch to appropriate fallback
+				if DeviceState.lastActiveDevice == "Gamepad" then
+					if DeviceState.isRealMobileDevice and DeviceState.hasTouch then
+						debugPrint("SetupDeviceTracking: Switching back to Mobile after gamepad disconnect.")
+						AttemptSwitch("Mobile")
+					elseif DeviceState.hasKeyboard or DeviceState.hasMouse then
+						debugPrint("SetupDeviceTracking: Switching to Keyboard after gamepad disconnect.")
+						AttemptSwitch("Keyboard")
+					elseif DeviceState.isRealMobileDevice then -- Fallback for mobile platform
+						AttemptSwitch("Mobile")
+					else -- Fallback for non-mobile
+						AttemptSwitch("Keyboard")
+					end
+				else
+					debugPrint("SetupDeviceTracking: Gamepad disconnected, but it wasn't the active device.")
+				end
+			else
+				debugPrint("SetupDeviceTracking: Gamepad reconnected quickly?")
+				DeviceState.hasGamepad = true
+				-- No need to switch here, connection alone doesn't switch on mobile platform.
+			end
+		end)
+	end))
+
+	-- Gamepad Input (Thumbsticks, Triggers, etc.) & Mouse Movement
+	table.insert(deviceTrackingConnections, UserInputService.InputChanged:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.Gamepad1 then
+			if input.Delta.Magnitude > 0.01 or input.Position.Magnitude > SETTINGS.DEVICE_DETECTION.THUMBSTICK_THRESHOLD then
+				lastInputTypeDetected = "Gamepad"; DeviceState.hasGamepad = true
+				AttemptSwitch("Gamepad") -- First *actual* input triggers the switch
+			end
+		elseif input.UserInputType == Enum.UserInputType.MouseMovement then
+			lastInputTypeDetected = "Mouse"; DeviceState.hasMouse = true
+		end
+	end))
+
+	-- Keyboard / Mouse Button / Gamepad Button Presses
+	table.insert(deviceTrackingConnections, UserInputService.InputBegan:Connect(function(input, gameProcessed)
+		if gameProcessed then return end
+
+		if input.UserInputType == Enum.UserInputType.Keyboard then
+			lastInputTypeDetected = "Keyboard"; DeviceState.hasKeyboard = true
+			AttemptSwitch("Keyboard") -- First *actual* input triggers the switch
+		elseif input.UserInputType == Enum.UserInputType.Gamepad1 then
+			lastInputTypeDetected = "Gamepad"; DeviceState.hasGamepad = true
+			AttemptSwitch("Gamepad") -- First *actual* input triggers the switch
+		elseif input.UserInputType == Enum.UserInputType.MouseButton1 or
+			input.UserInputType == Enum.UserInputType.MouseButton2 or
+			input.UserInputType == Enum.UserInputType.MouseButton3 then
+			lastInputTypeDetected = "Mouse"; DeviceState.hasMouse = true
+			AttemptSwitch("Keyboard") -- Mouse click implies keyboard focus
+		elseif input.UserInputType == Enum.UserInputType.Touch then
+			lastInputTypeDetected = "Touch"; DeviceState.hasTouch = true
+			if DeviceState.isRealMobileDevice then
+				AttemptSwitch("Mobile")
+			end
+		end
+	end))
+
+	debugPrint("SetupDeviceTracking: Device tracking setup complete. Initial Active Device:", DeviceState.lastActiveDevice)
+end
+
+--// Character Lifecycle Management //--
+function MobileController:WatchCharacterLifecycle()
+	local player = Players.LocalPlayer
+	if not player then return end
+
+	self:CleanupCharacterConnections()
+	debugPrint("WatchCharacterLifecycle: Starting...")
+
+	local charAddedConn = player.CharacterAdded:Connect(function(character)
+		debugPrint("WatchCharacterLifecycle: CharacterAdded event fired for character:", character:GetFullName())
+
+		task.delay(SETTINGS.GENERAL.CHARACTER_RESET_DELAY, function()
+			-- == Pre-Checks (Crucial after delay) ==
+			local currentPlayer = Players.LocalPlayer
+			if not currentPlayer or not currentPlayer.Parent then debugPrint("WatchCharacterLifecycle: Player disconnected. Aborting."); return end
+			if not character or not character.Parent or character ~= currentPlayer.Character then debugPrint("WatchCharacterLifecycle: Character invalid/changed. Aborting."); return end
+			local playerGui = currentPlayer:FindFirstChild("PlayerGui")
+			if not playerGui then warn("WatchCharacterLifecycle: PlayerGui not found post-respawn. Cannot proceed."); return end
+			debugPrint("WatchCharacterLifecycle: Executing delayed CharacterAdded logic...")
+
+			-- == State Reset and Re-evaluation ==
+			DeviceState.isTransitioning = false -- Reset transition state first
+			DeviceState.frameVisibilityTween = nil
+			DeviceState.scaleVisibilityTween = nil
+			debugPrint("WatchCharacterLifecycle: Transition state reset.")
+
+			-- Gamepad kontrolü - Gamepad varsa direkt gizle
+			if DeviceState.hasGamepad then
+				local gamepadConnected = false
+				for _, gamepad in ipairs(Enum.UserInputType:GetEnumItems()) do
+					if string.find(gamepad.Name, "Gamepad") and UserInputService:GetGamepadConnected(gamepad) then
+						gamepadConnected = true
+						break
+					end
+				end
+
+				if gamepadConnected then
+					debugPrint("WatchCharacterLifecycle: Gamepad bağlı, mobil UI gizlenecek")
+					DeviceState.lastActiveDevice = "Gamepad"
+
+					-- Eğer UI zaten kuruluysa, gizle
+					if mobileFrame and mobileFrame.Parent then
+						self:HideMobileUI()
+					end
+
+					-- Diğer işlemleri atla
+					return
+				end
+			end
+
+			local platformType, isMobilePlatform = self:DetectPlatform()
+			debugPrint("WatchCharacterLifecycle: Post-Respawn Platform Check - Type:", platformType, "| IsMobilePlatform:", isMobilePlatform)
+
+			inputEvents = self:FindInputEvents() -- Re-find module
+			if not inputEvents then warn("WatchCharacterLifecycle: InputEvents module not found post-respawn!") end
+
+			-- == UI Setup / Reset Logic ==
+			local uiReady = false
+			if isMobilePlatform then
+				debugPrint("WatchCharacterLifecycle: Platform IS mobile. Ensuring UI is set up and visible.")
+				local mbUI = playerGui:FindFirstChild("MB_UI")
+				if mbUI and mbUI:IsA("ScreenGui") then mobileFrame = mbUI:FindFirstChild("MobileFrame") else mobileFrame = nil end
+
+				if not mobileFrame or not mobileFrame.Parent then
+					debugPrint("WatchCharacterLifecycle: MobileFrame missing/invalid post-respawn. Attempting full SetupUI...")
+					self:SetupUI() -- SetupUI updates mobileFrame internally
+					if mobileFrame and mobileFrame.Parent then
+						debugPrint("WatchCharacterLifecycle: SetupUI completed successfully post-respawn.")
+						uiReady = true
+					else
+						warn("WatchCharacterLifecycle: SetupUI FAILED post-respawn.")
+					end
+				else
+					debugPrint("WatchCharacterLifecycle: MobileFrame exists post-respawn. Resetting state...")
+					self:CancelTransitions()
+					self:ResetAllToggleStates()
+					local success, err = pcall(function() self:SetupButtonFunctionality(mobileFrame) end)
+					if not success then warn("WatchCharacterLifecycle: Error re-running SetupButtonFunctionality post-respawn:", err) end
+					uiReady = true
+				end
+
+				-- **Final Step for Mobile:** If UI is ready, update its visibility WITH animation
+				if uiReady then
+					debugPrint("WatchCharacterLifecycle: Post-Respawn - UI ready, calling UpdateUIBasedOnDeviceState(false) for animation.")
+					-- Ensure scale is reset before animation if needed
+					local uiScale = mobileFrame:FindFirstChildOfClass("UIScale")
+					if uiScale and mobileFrame.GroupTransparency == 1 then uiScale.Scale = 1.0 end -- Reset scale if hidden
+					-- Call update with animation (false)
+					self:UpdateUIBasedOnDeviceState(false)
+				else
+					debugPrint("WatchCharacterLifecycle: Post-Respawn - UI is NOT ready after setup/reset attempt.")
+				end
+			else
+				-- Platform is NOT mobile after respawn
+				debugPrint("WatchCharacterLifecycle: Platform IS NOT mobile post-respawn. Ensuring UI is hidden.")
+				if mobileFrame and mobileFrame.Parent then
+					debugPrint("WatchCharacterLifecycle: Hiding existing MobileFrame post-respawn.")
+					self:HideMobileUI()
+				else
+					debugPrint("WatchCharacterLifecycle: No MobileFrame found to hide post-respawn.")
+				end
+				isUISetup = mobileFrame and mobileFrame.Parent and mobileFrame.Visible
+			end
+			debugPrint("WatchCharacterLifecycle: Delayed CharacterAdded logic finished.")
+		end)
+	end)
+	table.insert(characterConnections, charAddedConn)
+
+	-- Character Removing Listener (Remains the same)
+	local charRemovingConn = player.CharacterRemoving:Connect(function(character)
+		debugPrint("WatchCharacterLifecycle: CharacterRemoving event fired.")
+		self:CancelTransitions()
+		self:CleanupCharacterRuntimeConnections()
+		isRunning = false
+		isDashOnCooldown = false
+		inputEvents = nil
+		debugPrint("WatchCharacterLifecycle: Character runtime state cleared on removal.")
+	end)
+	table.insert(characterConnections, charRemovingConn)
+
+	-- R Key Listener (Remains the same)
+	if SETTINGS.STUDIO_TESTING.RESET_CHARACTER_CHECK then
+		local rKeyConn = UserInputService.InputBegan:Connect(function(input, gameProcessed)
+			if not gameProcessed and input.KeyCode == Enum.KeyCode.R and RunService:IsStudio() then
+				debugPrint("WatchCharacterLifecycle: 'R' key detected in Studio, resetting UI states.")
+				if mobileFrame and mobileFrame.Parent then
+					self:CancelTransitions()
+					self:ResetAllToggleStates()
+				end
+			end
+		end)
+		table.insert(characterConnections, rKeyConn)
+	end
+
+	-- Gamepad bağlantısı kontrolü
+	local gamepadConnectedConn = UserInputService.GamepadConnected:Connect(function(gamepad)
+		debugPrint("WatchCharacterLifecycle: Gamepad connected:", gamepad)
+		DeviceState.hasGamepad = true
+		DeviceState.lastActiveDevice = "Gamepad"
+
+		-- UI'yi hemen gizle
+		if mobileFrame and mobileFrame.Parent and mobileFrame.Visible then
+			self:HideMobileUI()
+		end
+	end)
+	table.insert(characterConnections, gamepadConnectedConn)
+
+	debugPrint("WatchCharacterLifecycle: Listeners set up.")
+end
+
+--// Initialization //--
+function MobileController:Initialize()
+	-- Prevent double initialization
+	if self._initialized then return self end
+	self._initialized = true
+	debugPrint("MobileController: Initializing...")
+
+	-- AnimationManager'ın düzgün tanımlandığından emin ol
+	if not AnimationManager then
+		warn("MobileController: AnimationManager is not defined! Creating a default version.")
+		AnimationManager = {
+			-- Temel fonksiyonlar sağla
+			CancelAll = function() end,
+			ShowUI = function(frame, options)
+				if frame then 
+					frame.Visible = true
+					frame.GroupTransparency = 0
+				end
+				if options and options.OnComplete then options.OnComplete() end
+			end,
+			HideUI = function(frame, options)
+				if frame then 
+					frame.Visible = false 
+					frame.GroupTransparency = 1
+				end
+				if options and options.OnComplete then options.OnComplete() end
+			end,
+			ShowFlash = function(flash) if flash then flash.Visible = true end end,
+
+			-- Temel config değerleri
+			CONFIG = {
+				BUTTON = {
+					RUN = {
+						DEFAULT_SIZE = UDim2.new(0, 70, 0, 70),
+						TOGGLE_OFF_COLOR = Color3.fromRGB(255, 255, 255),
+						TOGGLE_ON_COLOR = Color3.fromRGB(0, 200, 255)
+					},
+					DASH = {
+						DEFAULT_SIZE = UDim2.new(0, 70, 0, 70)
+					},
+					JUMP = {
+						DEFAULT_SIZE = UDim2.new(0, 90, 0, 90),
+						DEFAULT_COLOR = Color3.fromRGB(255, 255, 255),
+						PRESSED_COLOR = Color3.fromRGB(0, 200, 255)
+					}
+				},
+				COOLDOWN = {
+					FILL_START_SIZE = UDim2.new(0, 70, 0, 70)
+				}
+			}
+		}
+	end
+
+	task.spawn(function()
+		local player = Players.LocalPlayer
+		if not player then player = Players:GetPropertyChangedSignal("LocalPlayer"):Wait() end
+		if not player then warn("MobileController: Initialization failed - LocalPlayer not found."); return end
+
+		if not game:IsLoaded() then debugPrint("MobileController: Waiting for game to load..."); game.Loaded:Wait() end
+		debugPrint("MobileController: Game loaded.")
+
+		local playerGui = player:WaitForChild("PlayerGui", 15)
+		if not playerGui then warn("MobileController: Initialization failed - PlayerGui timed out."); return end
+		debugPrint("MobileController: PlayerGui found.")
+
+		-- BAŞLATMA SIRASINDA MOBİL KONTROLÜ: Dokunmatik veya ekran boyutu nedeniyle mobil olabilir
+		if not RunService:IsStudio() then
+			-- Dokunmatik ekran kontrolü
+			if UserInputService.TouchEnabled then
+				debugPrint("MobileController: Touch enabled detected during init! Marking as mobile device.")
+				DeviceState.isRealMobileDevice = true
+				DeviceState.hasTouch = true
+				DeviceState.lastActiveDevice = "Mobile"
+			end
+
+			-- Ekran boyutu kontrolü
+			local camera = workspace.CurrentCamera
+			if camera then
+				local viewportSize = camera.ViewportSize
+				local isSmallScreen = viewportSize.X < 1024 or viewportSize.Y < 768
+				local isPortraitOrientation = viewportSize.X / viewportSize.Y < 1.0
+
+				if isSmallScreen or isPortraitOrientation then
+					debugPrint("MobileController: Small/portrait screen detected during init! Marking as mobile device.")
+					DeviceState.isRealMobileDevice = true
+					DeviceState.lastActiveDevice = "Mobile"
+				end
+			end
+		end
+
+		-- 1. Initial Platform Detection
+		local platformType, isMobile = self:DetectPlatform()
+		debugPrint("MobileController: Initial platform detection:", platformType, "| IsMobilePlatform:", isMobile)
+
+		-- 2. Start Device Tracking
+		debugPrint("MobileController: Setting up device tracking...")
+		self:SetupDeviceTracking() -- Handles initial device state and potentially instant UI update if needed before char logic
+
+		-- 3. Start Character Lifecycle Watcher
+		debugPrint("MobileController: Setting up character lifecycle watcher...")
+		self:WatchCharacterLifecycle()
+
+		-- 4. Handle Initial Character State (If character exists *before* CharacterAdded connects)
+		if player.Character and player.Character.Parent then
+			debugPrint("MobileController: Character already exists. Triggering setup logic manually after delay...")
+			task.delay(SETTINGS.GENERAL.INITIAL_SETUP_DELAY, function() -- Use INITIAL_SETUP_DELAY here
+				-- Re-validate player and character after delay
+				if not player or not player.Parent or not player.Character or not player.Character.Parent then
+					debugPrint("MobileController: Initial character lost during delay.")
+					return
+				end
+				debugPrint("MobileController: Executing delayed setup logic for existing initial character...")
+
+				-- Re-detect platform state
+				local currentPlatform, currentIsMobile = self:DetectPlatform()
+				debugPrint("MobileController: Initial Char - Platform:", currentPlatform, "| IsMobile:", currentIsMobile)
+
+				-- Re-evaluate InputEvents module reference
+				inputEvents = self:FindInputEvents()
+				if not inputEvents then warn("MobileController: Initial Char - InputEvents not found!") end
+
+				local uiReady = false
+				if currentIsMobile then
+					-- Check if UI needs full setup or just reset
+					local mbUI = playerGui:FindFirstChild("MB_UI")
+					if mbUI and mbUI:IsA("ScreenGui") then mobileFrame = mbUI:FindFirstChild("MobileFrame") else mobileFrame = nil end
+
+					if not mobileFrame or not mobileFrame.Parent then
+						debugPrint("MobileController: Initial Char - Mobile UI missing, calling SetupUI...")
+						self:SetupUI() -- SetupUI updates mobileFrame internally
+						if mobileFrame and mobileFrame.Parent then uiReady = true else warn("MobileController: Initial Char - SetupUI failed.") end
+					else
+						debugPrint("MobileController: Initial Char - Mobile UI exists, resetting state...")
+						self:CancelTransitions()
+						self:ResetAllToggleStates()
+						local success, err = pcall(function() self:SetupButtonFunctionality(mobileFrame) end)
+						if not success then warn("MobileController: Initial Char - Error re-setting button functionality:", err) end
+						uiReady = true
+					end
+
+					-- If UI is ready (either newly setup or reset), show it with animation
+					if uiReady then
+						debugPrint("MobileController: Initial Char - UI ready, calling UpdateUIBasedOnDeviceState(false) for animation.")
+						-- Explicitly reset transition state before showing
+						DeviceState.isTransitioning = false
+						DeviceState.frameVisibilityTween = nil
+						DeviceState.scaleVisibilityTween = nil
+						local uiScale = mobileFrame:FindFirstChildOfClass("UIScale")
+						if uiScale then uiScale.Scale = 1.0 end -- Ensure scale is 1 before animation
+						self:UpdateUIBasedOnDeviceState(false) -- Use animation
+					end
+				else
+					-- Not mobile, ensure UI is removed/hidden if present
+					debugPrint("MobileController: Initial Char - Platform not mobile, ensuring UI removed/hidden.")
+					if mobileFrame and mobileFrame.Parent then self:HideMobileUI() end
+					isUISetup = mobileFrame and mobileFrame.Parent and mobileFrame.Visible
+				end
+				debugPrint("MobileController: Delayed setup for existing initial character finished.")
+			end)
+		else
+			debugPrint("MobileController: No character initially, waiting for CharacterAdded event.")
+		end
+
+		debugPrint("MobileController: Initialization sequence complete.")
+	end)
+
+	return self
+end
+
+--// Start Initialization //--
+MobileController:Initialize()
+
+--// Return Module //--
+return MobileController
